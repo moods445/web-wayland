@@ -1,0 +1,95 @@
+/* web-wayland 状态条样式：深色玻璃拟态 + Hyprland 生态质感
+   设计令牌：近黑底 + 10px 圆角 + 1px 内侧高光 + 克制动效 */
+
+* {
+    font-family: "Noto Sans CJK SC", "思源黑体", "Source Han Sans SC", sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    border: none;
+    border-radius: 0;
+    min-height: 0;
+}
+
+window#waybar {
+    background: rgba(11, 11, 15, 0.72);
+    color: #e6e6ec;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    transition: background 160ms ease;
+}
+
+window#waybar.hidden {
+    opacity: 0.2;
+}
+
+tooltip {
+    background: rgba(18, 18, 24, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+}
+
+tooltip label {
+    color: #e6e6ec;
+}
+
+#workspaces {
+    padding: 0 6px;
+}
+
+#workspaces button {
+    padding: 0 7px;
+    margin: 5px 1px;
+    color: #9a9aa8;
+    border-radius: 6px;
+    transition: all 140ms ease;
+}
+
+#workspaces button:hover {
+    background: rgba(90, 169, 255, 0.16);
+    color: #ffffff;
+}
+
+#workspaces button.active {
+    color: #5aa9ff;
+    background: rgba(90, 169, 255, 0.14);
+}
+
+#workspaces button.urgent {
+    color: #ff5c5c;
+    background: rgba(255, 92, 92, 0.14);
+}
+
+#clock {
+    color: #ffffff;
+    padding: 0 14px;
+    letter-spacing: 0.3px;
+}
+
+#network,
+#pulseaudio,
+#battery,
+#tray {
+    padding: 0 10px;
+    color: #e6e6ec;
+}
+
+#network.disconnected {
+    color: #ff5c5c;
+}
+
+#pulseaudio.muted {
+    color: #9a9aa8;
+}
+
+#battery.charging {
+    color: #48d597;
+}
+
+#battery.warning {
+    color: #f2c14e;
+}
+
+#battery.critical {
+    color: #ff5c5c;
+}

@@ -1,0 +1,18 @@
+[Unit]
+Description=web-wayland Hyprland 桌面会话（iGPU）
+# seatd 提供 DRM 访问权：SSH/无 seat 会话下 libseat 的唯一出路
+After=seatd.service
+Wants=seatd.service
+
+[Service]
+Type=simple
+Environment=LIBSEAT_BACKEND=seatd
+Environment=AQ_DRM_DEVICES=/dev/dri/card1
+Environment=HYPRLAND_NO_SD_NOTIFY=1
+Environment=HYPRLAND_NO_CRASHREPORTER=1
+ExecStart=/usr/bin/start-hyprland
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

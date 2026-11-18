@@ -1,0 +1,49 @@
+# 构建产物
+gateway/target/
+capture/build*/
+build/
+out/
+dist/
+node_modules/
+
+# 由脚本生成的代码/数据（见 README 快速开始）
+capture/src/generated/
+web/cert-hash.json
+
+# 证书与私钥（scripts/gen-ca.sh 生成，含私钥，切勿入库）
+certs/
+*.key
+*.pem
+*.p12
+*.pfx
+*.srl
+
+# 编译中间文件
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# 日志与临时文件
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.cache/
+__pycache__/
+*.pyc
+
+# 本地环境变量
+.env
+.env.*
+
+# 编辑器与工具目录
+.idea/
+.vscode/
+.codebuddy/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,18 @@
+[Unit]
+Description=web-wayland WebTransport 网关（:8443 tcp+udp）
+After=ww-session.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gitWorkspace/web-wayland
+Environment=WW_CERT=certs/server.crt
+Environment=WW_KEY=certs/server.key
+Environment=WW_WT_CERT=certs/wt.crt
+Environment=WW_WT_KEY=certs/wt.key
+Environment=WW_WEBROOT=web
+ExecStart=%h/gitWorkspace/web-wayland/gateway/target/release/wwgw
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

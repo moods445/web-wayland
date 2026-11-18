@@ -1,0 +1,14 @@
+[Unit]
+Description=web-wayland 抓帧编码（ext-image-copy-capture + VAAPI）
+After=ww-session.service ww-gateway.service
+
+[Service]
+Type=simple
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=HYPRLAND_INSTANCE_SIGNATURE=
+ExecStart=%h/gitWorkspace/web-wayland/capture/build/wwcap --video %t/ww-video.sock --ctrl %t/wwcap-ctrl.sock --qp 26 --fps 60
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
