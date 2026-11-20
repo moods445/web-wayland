@@ -1,7 +1,7 @@
 # web-wayland 项目完整汇总
 
 > 本文是整个项目从需求提出到当前的完整汇总：诉求演进、系统架构、全部文件改动、全部 bug 修复、性能实测、测试工具、当前状态与待决策事项。
-> 聚焦某主题时可转阅：`README.md`（上手/部署）、`docs/architecture.md`（架构/踩坑基线）、`docs/streaming-conclusions.md`（最新一轮结论与 4K60 分析）。
+> 聚焦某主题时可转阅：`README.md`（上手/部署）、`docs/architecture.md`（架构/踩坑基线）、`docs/streaming-conclusions.md`（最新一轮结论与 4K60 分析）、`docs/sunshine-moonlight.md`（旁挂 Sunshine + Moonlight 部署）。
 
 ---
 
@@ -141,7 +141,7 @@ web (JS, 无构建)
 | `scripts/pipewire/50-ww-desk.conf`（新建）| 虚拟 sink `ww-desk`（只抓应用声音，避免混入麦克风）|
 | `scripts/ww-session.service` / `ww-gateway.service` / `ww-cap.service` | systemd 常驻单元；`ww-cap` 用启动器 + `Restart=always`，无会话 30s 休眠 |
 | `config/hypr/hyprland.conf` | `accel_profile=flat` + `force_no_accel`；`SUPER+Enter`→foot，`SUPER+D`→fuzzel |
-| `README.md` / `docs/architecture.md` / `docs/streaming-conclusions.md` / `docs/TEST-CASES.md` / 本文 | 文档 |
+| `README.md` / `docs/architecture.md` / `docs/streaming-conclusions.md` / `docs/sunshine-moonlight.md` / `docs/TEST-CASES.md` / 本文 | 文档 |
 
 ---
 

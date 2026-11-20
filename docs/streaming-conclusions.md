@@ -413,69 +413,7 @@ systemctl --user start ww-session ww-gateway ww-cap
 光标不再经过 抓帧→编码→网络→解码→上屏 这条链路，延迟从 26~52ms 降到**系统指针本身的延迟**（≈0），
 且不再受丢帧、帧节奏抖动影响。视频侧依旧 56fps，但"拖手"感消失。
 
-## 12. 旁挂 Sunshine + Moonlight：跑通记录（2026-11-20）
+## 12. 旁挂 Sunshine + Moonlight（2026-11-20）
 
-结论：**Intel 路径可用，1080p60 能跑**；NVIDIA 路径抓帧失败，不可用。全程不改项目代码，
-Sunshine 只作为旁挂服务端，服务端由 `scripts/sunshine-wayland.sh` 起停。
-
-### 12.1 运行环境
-
-- Sunshine 2026.914.233613（Debian trixie 包），Moonlight 6.2.0（GitHub AppImage）
-- 桌面：`scripts/switch-gpu.sh intel` 起的 Hyprland（i915 / `card1`），抓帧目标是 headless 输出 `HEADLESS-2`（1920x1080@60）
-- 该会话下 eDP-1 仍是 `0x0`（Xorg/sddm 占 DRM master，面板 atomic commit 被拒），
-  但 headless 输出不受影响，Sunshine 抓的就是它
-- Sunshine 配置：`capture = wlr`、`encoder = vaapi`、`output_name = HEADLESS-2`
-
-### 12.2 实测数据
-
-| 项目 | 实测值 |
-|---|---|
-| 抓帧 | `wlr`（`zwlr_screencopy_manager_v1` v3），日志 `[wlgrab] Monitor 1 is HEADLESS-2` |
-| 编码 | `h264_vaapi`（Intel iHD 25.2.3），RC framerate 60/1 |
-| 码率 | 14,988,000 bps（客户端请求 20 Mbps，Sunshine 按链路折算） |
-| 色彩 | SDR **Rec.601** / 8-bit / JPEG range（项目链路是 BT.709 + full range） |
-| 服务端帧处理延迟 | 4 分钟稳态 avg **9.7~10.1ms**，最后 20s 窗口 min 6.9ms / max 27.2ms / avg **9.17ms** |
-| 客户端 | Moonlight：`Video stream is 1920x1080x60 (format 0x1)`、`Test decode successful` |
-| 连接 | `CLIENT CONNECTED` → `CLIENT DISCONNECTED` 正常，期间无 `Frame capture failed` |
-
-延迟取自 debug 级别日志的 `Frame processing latency` 行（抓帧 + 编码，不含网络与客户端解码）。
-
-### 12.3 部署踩坑（都已固化进脚本）
-
-1. **NVIDIA 路径不可用**：`capture = wlr` 在独显上每帧报
-   `eglCreateImageKHR ... EGL_BAD_PARAMETER` + `Frame capture failed`（Hyprland 日志里失败 ~3.6 次/秒，
-   NVENC 占用 0%）。该构建没有 shm 回退，`portalgrab` 又只编了 gtk 后端、`kms` 不认 `HEADLESS` 连接器。
-   另外配置值必须写 `wlr`，写 `wlgrab` 会直接 `Unable to initialize capture method`。
-2. **双抓帧**：Sunshine 与 `wwcap` 同时抓 screencopy 会让合成器每帧服务两次（历史事故 58→30fps），
-   脚本启动前会先停 `wwcap`。
-3. **进程保活**：只加 `nohup` 时，启动它的终端/IDE 会话一结束 Sunshine 就被收走
-   （表现是「刚起来就连不上」，日志停在版本号之后没有退出原因），必须 `setsid`。
-4. **键鼠不生效**：Sunshine 用 `/dev/uinput`（`root:input 0660`）创建虚拟键鼠，
-   `aio` 不在 `input` 组时打不开，远端口完全没反应。修法：`usermod -aG input aio`，
-   并在重新登录前用 `sg input -c` 借组启动（脚本已内置分支）。
-   验证：串流中注入 `SUPER+Return`，headless 桌面新开一个 foot 窗口；内核同时出现
-   `libvirtualhid Keyboard/Mouse` 设备，Hyprland 识别为 `libvirtualhid-keyboard-1` / `libvirtualhid-mouse`。
-
-### 12.4 与项目自有链路的关系
-
-- **二选一**：两者都要抢 screencopy 抓帧，不能同时跑。
-- **画质不是同一个档**：Moonlight 这条链路是 Rec.601 + JPEG range + 4:2:0，桌面文字与纯色块的色彩
-  不如 `wwclient`（BT.709 + full range + 4:4:4）。
-- **上限是 1080p60**：Intel 上 Hyprland 合成 4K 只有 20~22fps（见 §9），4K 只能走独显，而独显路径在
-  Sunshine 下抓帧失败；本机因此没有 4K60 的 Moonlight 路线。
-
-### 12.5 复现命令
-
-```bash
-scripts/switch-gpu.sh intel            # 起 Hyprland（若已在跑可跳过）
-scripts/sunshine-wayland.sh start      # 停 wwcap → 写 3 项配置 → setsid 起 Sunshine
-scripts/sunshine-wayland.sh status     # 看进程 + 最近抓帧/编码日志
-scripts/sunshine-wayland.sh stop
-
-# 客户端（同机验证用）
-DISPLAY=:1 QT_QPA_PLATFORM=xcb ./Moonlight.AppImage list 127.0.0.1
-DISPLAY=:1 QT_QPA_PLATFORM=xcb ./Moonlight.AppImage stream 127.0.0.1 "Desktop" \
-  --1080 --fps 60 --bitrate 20000 --display-mode windowed
-
-# 需要帧延迟数字时，临时在 sunshine.conf 加 min_log_level = debug
-```
+已单独成文，见 [sunshine-moonlight.md](sunshine-moonlight.md)：Intel 路径 1080p60 可跑
+（服务端帧处理 avg 9.7~10.1ms），NVIDIA 路径抓帧失败；含前置条件、脚本用法、实测数据与故障排查。

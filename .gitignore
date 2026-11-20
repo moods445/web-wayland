@@ -47,7 +47,9 @@ __pycache__/
 .codebuddy/
 .DS_Store
 Thumbs.db
+.trae
 
 # 原生客户端构建产物
 native/wwclient
 native/wwsrc
+
