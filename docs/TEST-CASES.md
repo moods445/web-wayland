@@ -26,6 +26,7 @@
 - [L. 串流策略](#l-串流策略)
 - [M. 色度采样 4:4:4](#m-色度采样-444)
 - [N. 开机自启与空闲休眠](#n-开机自启与空闲休眠)
+- [O. 原生客户端（wwclient）](#o-原生客户端wwclient)
 
 ---
 
@@ -331,6 +332,45 @@ High 4:4:4 Predictive(244)，文字/红蓝边缘更锐利，码率约 +30~50%。
 | BOOT-02 | 无会话自动休眠 | 已连过又断开全部客户端 | 等 30 秒后看 `journalctl --user -u ww-cap -n 5`，并测 CPU | 日志「无会话 30 秒，进入休眠（已停抓帧/编码）」；进程 CPU 接近 0，不再刷 fps 日志 | [main.c](../capture/src/main.c) 的主循环 `suspended` 判定 |
 | BOOT-03 | 新会话唤醒 | wwcap 已休眠 | 浏览器连上 | 日志「客户端会话接入」「会话接入，恢复采集」；首帧为 IDR，约 1 秒出图 | [main.rs](../gateway/src/main.rs) 的 `active` 通知、[main.c](../capture/src/main.c) 的 `active` 分支 |
 | BOOT-04 | 桌面配置生效 | systemd 启动的会话 | `hyprctl monitors -j`；`hyprctl dispatch exec foot` | HEADLESS 输出 1920x1080 scale 1.0；能创建窗口（说明加载的是项目配置，不是 `/usr/share/hypr/hyprland.lua`） | [ww-session.service](../scripts/ww-session.service) 的 `--config` |
+
+---
+
+## O. 原生客户端（wwclient）
+
+原生客户端走网关新增的 UDP 通道 `:8444`（与浏览器 `:8443` 并行），复用同一套 24 字节分片与
+同一套输入 JSON。**它不依赖浏览器，也不依赖合成器**：测试流可以由
+[wwsrc](../native/wwsrc.c) 直接注入 `ww-video.sock`，因此在合成器故障时仍可完整验证
+「分片 → 重组 → 解码 → 上屏 → 输入」这条链路。
+
+收益数据与对照结论见 [原生客户端收益评估](./native-client-assessment.md)。
+
+前置条件：
+
+1. 网关在跑且监听 `:8444/udp`（`ss -lunp | grep 8444`）。
+2. `native/` 已 `make`，且**要么** wwcap 在抓帧 **要么** 用 `wwsrc` 喂离线流（真机抓帧坏掉时的替代）。
+3. `env -u LD_LIBRARY_PATH`（IDE 终端注入了私有 libstdc++）。
+
+```bash
+cd native
+./wwsrc --file /tmp/clip.h264 --fps 60 &                 # 合成源（与 wwcap 同分片格式）
+./wwclient --host 127.0.0.1 --port 8444 --no-present --bench 10 --stats-json /tmp/s.json
+SDL_VIDEODRIVER=offscreen ./wwclient --size 1920x1080 --no-vsync --dump-gl /tmp/gl.ppm
+```
+
+| 编号 | 用例 | 前置 | 步骤 | 预期结果 | 对应位置 |
+| --- | --- | --- | --- | --- | --- |
+| NAT-01 | HELLO 握手与能力回报 | 网关运行 | 启客户端，看 stderr | 1 s 内打印 `服务端就绪: {"t":"hello_ack",...}`，含 `chroma444/encoder/color/range` | [native.rs](../gateway/src/native.rs) 的 `T_HELLO` 分支、[wwclient.c](../native/wwclient.c) 的 `T_HELLO_ACK` |
+| NAT-02 | 分片重组完整 | 稳定流 10 s | `--stats-json` 读 `bad_frags` | `bad_frags === 0`，`frames` 与源端发送帧数一致（±1） | [wwclient.c](../native/wwclient.c) 的 `reasm_frag` |
+| NAT-03 | 满帧与延迟预算 | 1080p60 源 | `--no-present --bench 10` | `fps ≥ 59`，`decode_p50 < 8 ms`，`e2e_p50 < 15 ms`（同机时钟） | [wwclient.c](../native/wwclient.c) 的 `summary` 输出 |
+| NAT-04 | 丢片 → kf → IDR 恢复 | `wwsrc --drop 0.1` | 观察 `dropped/skipped/undecodable` 与源端日志 | 有 `dropped` 增长；`undecodable === 0`（不会把花屏送去解码）；恢复后 fps 回升 | [wwclient.c](../native/wwclient.c) 的 `request_keyframe` + `g_need_key`、[wwsrc.c](../native/wwsrc.c) 控制口 |
+| NAT-05 | 4:4:4 / 全范围 / 709 色彩 | 444 全范围源 | `--dump-frame` 落帧，与参考帧 PSNR/ΔE | PSNR ≥ 48 dB，ΔE2000 平均 < 1.0（实测 51.96 dB / 0.126） | [wwclient.c](../native/wwclient.c) 的 `dump_ppm` |
+| NAT-06 | GL 上屏色彩等价 | offscreen 驱动可用 | `--dump-gl` 读回 framebuffer 后与参考帧比对 | 与 NAT-05 同量级（实测同为 51.96 dB），通道偏差 < 1/255 | [wwclient.c](../native/wwclient.c) 的 `gl_readback` |
+| NAT-07 | 上屏耗时可测 | offscreen 或真实窗口 | 读 `present_p50_ms / p95` | p50 < 4 ms（无 vsync 的乐观值，报告须注明） | [wwclient.c](../native/wwclient.c) 的 `gl_present` |
+| NAT-08 | 输入注入 | 客户端窗口有焦点 | 移动鼠标、按键、滚轮 | 服务端 `hyprctl cursorpos` 跟随；按键不粘；`kk/pb/pw` 与浏览器同格式 | [wwclient.c](../native/wwclient.c) 的 `sdl_to_evdev` / `send_move` |
+| NAT-09 | 输入租约隔离 | 浏览器与原生同时连 | 两边交替发输入 | 与 CONN-05 相同的 1.5 s 租约，不互相拽光标 | [native.rs](../gateway/src/native.rs) 的 `claim_input` |
+| NAT-10 | peer 超时释放 | 客户端运行中 `kill -9` | 等 5 s 看网关日志 | 打印「原生客户端超时断开」，向 wwcap 发 `keysreset/mode reset/fps 0/astream 0` | [native.rs](../gateway/src/native.rs) 的 `release_and_idle` |
+| NAT-11 | 空闲休眠联动 | 只有一个原生客户端 | 断开后等 30 s | wwcap 进入休眠；新客户端连上立即唤醒并出 IDR | [main.c](../capture/src/main.c) 的 `suspended` + `active` 分支 |
+| NAT-12 | 弱网灵敏度矩阵 | `wwsrc --drop 0/0.1/1` | 各跑 10 s | 0%：60 fps/0 损帧；0.1%：仍 >45 fps 且 `undecodable=0`；1%：显著掉帧但不崩、不花屏 | [wwsrc.c](../native/wwsrc.c) 的 `--drop` |
 
 ---
 

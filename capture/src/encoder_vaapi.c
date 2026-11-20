@@ -57,6 +57,7 @@ struct ww_enc {
     bool chroma444;        /* true = yuv444p（仅 NVENC） */
     int64_t bitrate_bps;   /* >0 = 目标码率；实际是否走 CBR 看 cbr */
     bool cbr;              /* true = 已按 CBR 打开，qp 不参与码控 */
+    int color;             /* WW_COLOR_601 / _709 / _709_FULL */
     struct SwsContext *sws_nv12_444;   /* 零拷贝 NV12 → YUV444P 回退转换 */
     /* 内部分段耗时（微秒） */
     uint64_t stat_conv_us, stat_up_us, stat_send_us, stat_n;
@@ -67,6 +68,42 @@ static uint64_t enc_now_us(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+/* 按 color 写编码器 VUI。全范围必须同时改 color_range：
+   只改矩阵不改 range，解码端会把 0~255 当 16~235 解释，黑色发灰、白色发暗。 */
+static void apply_vui(struct ww_enc *e)
+{
+    if (e->color == WW_COLOR_601) {
+        e->ctx->colorspace = AVCOL_SPC_SMPTE170M;
+        e->ctx->color_primaries = AVCOL_PRI_SMPTE170M;
+        e->ctx->color_trc = AVCOL_TRC_SMPTE170M;
+        e->ctx->color_range = AVCOL_RANGE_MPEG;
+        return;
+    }
+    e->ctx->colorspace = AVCOL_SPC_BT709;
+    e->ctx->color_primaries = AVCOL_PRI_BT709;
+    e->ctx->color_trc = AVCOL_TRC_BT709;
+    e->ctx->color_range = (e->color == WW_COLOR_709_FULL) ? AVCOL_RANGE_JPEG
+                                                         : AVCOL_RANGE_MPEG;
+}
+
+/* BGRA（0~255）→ YUV 的矩阵与范围。sws 默认按 limited 处理 dstRange，
+   全范围必须显式传 dstRange=1，否则 444 桌面画面对比度会被压掉。 */
+static void apply_sws_color(struct ww_enc *e, struct SwsContext *sws)
+{
+    if (!sws) {
+        return;
+    }
+    if (e->color == WW_COLOR_601) {
+        const int *coef = sws_getCoefficients(SWS_CS_ITU601);
+        sws_setColorspaceDetails(sws, coef, 1, coef, 0, 0, 1 << 16, 1 << 16);
+    } else {
+        const int *coef = sws_getCoefficients(SWS_CS_ITU709);
+        sws_setColorspaceDetails(sws, coef, 1, coef,
+                                 e->color == WW_COLOR_709_FULL ? 1 : 0,
+                                 0, 1 << 16, 1 << 16);
+    }
 }
 
 /* 给上层打印用：取走并清零累计值 */
@@ -236,10 +273,7 @@ static struct ww_enc *create_nvenc(struct ww_enc *e, int w, int h, int fps, int 
     e->ctx->max_b_frames = 0;
     e->ctx->gop_size = 120;
     /* NVENC 用 priv 的 qp（constqp），不要设 global_quality，否则会告警 */
-    e->ctx->colorspace = AVCOL_SPC_SMPTE170M;
-    e->ctx->color_primaries = AVCOL_PRI_SMPTE170M;
-    e->ctx->color_trc = AVCOL_TRC_SMPTE170M;
-    e->ctx->color_range = AVCOL_RANGE_MPEG;
+    apply_vui(e);
 
     /* 低延迟组合：p4 + ull + 不排队；码控二选一：CBR（目标码率）或 constqp */
     av_opt_set(e->ctx->priv_data, "preset", "p4", 0);
@@ -278,9 +312,9 @@ static struct ww_enc *create_nvenc(struct ww_enc *e, int w, int h, int fps, int 
     return e;
 }
 
-struct ww_enc *ww_enc_create_full(const char *kind, const char *drm_node,
-                                  int w, int h, int fps, int qp, bool chroma444,
-                                  int64_t bitrate_bps)
+static struct ww_enc *create_enc(const char *kind, const char *drm_node,
+                                 int w, int h, int fps, int qp, bool chroma444,
+                                 int64_t bitrate_bps, int color)
 {
     struct ww_enc *e = calloc(1, sizeof(*e));
     if (!e) {
@@ -290,6 +324,7 @@ struct ww_enc *ww_enc_create_full(const char *kind, const char *drm_node,
     e->h = h;
     e->fps = fps;
     e->qp = qp;
+    e->color = color;
     e->bitrate_bps = bitrate_bps > 0 ? bitrate_bps : 0;
 
     if (kind && !strcmp(kind, "nvenc")) {
@@ -379,11 +414,8 @@ struct ww_enc *ww_enc_create_full(const char *kind, const char *drm_node,
        延迟只剩编码本身。1080p VDEnc 单帧编码远小于 16.6ms，吞吐不受影响。 */
     av_opt_set_int(e->ctx->priv_data, "async_depth", 1, 0);
 
-    /* 信令必须与 libyuv 的 ARGBToI420 一致（BT.601 limited），否则解码端按 709 解释会发灰 */
-    e->ctx->colorspace = AVCOL_SPC_SMPTE170M;
-    e->ctx->color_primaries = AVCOL_PRI_SMPTE170M;
-    e->ctx->color_trc = AVCOL_TRC_SMPTE170M;
-    e->ctx->color_range = AVCOL_RANGE_MPEG;
+    /* 信令必须与实际转换矩阵一致，否则解码端按另一套矩阵解释会发灰/偏色 */
+    apply_vui(e);
 
     if (avcodec_open2(e->ctx, codec, NULL) < 0) {
         fprintf(stderr, "[enc] avcodec_open2 失败（QP=%d，目标码率 %lld bps）\n",
@@ -418,6 +450,26 @@ fail:
     }
     free(e);
     return NULL;
+}
+
+struct ww_enc *ww_enc_create_full(const char *kind, const char *drm_node,
+                                  int w, int h, int fps, int qp, bool chroma444,
+                                  int64_t bitrate_bps)
+{
+    return create_enc(kind, drm_node, w, h, fps, qp, chroma444, bitrate_bps, WW_COLOR_601);
+}
+
+struct ww_enc *ww_enc_create_cfg(const struct ww_enc_cfg *cfg)
+{
+    if (!cfg || cfg->w <= 0 || cfg->h <= 0) {
+        return NULL;
+    }
+    int color = cfg->color;
+    if (color < WW_COLOR_601 || color > WW_COLOR_709_FULL) {
+        color = WW_COLOR_601;
+    }
+    return create_enc(cfg->kind, cfg->drm_node, cfg->w, cfg->h, cfg->fps, cfg->qp,
+                      cfg->chroma444, cfg->bitrate_bps, color);
 }
 
 struct ww_enc *ww_enc_create_chroma(const char *kind, const char *drm_node,
@@ -632,6 +684,9 @@ int ww_enc_submit_cpu(struct ww_enc *e, const void *ptr, uint32_t fourcc, uint32
                 fprintf(stderr, "[enc] sws 初始化失败\n");
                 return -1;
             }
+            /* sws 默认按 limited + 601 解释；709 全范围必须显式设置，
+               否则 VUI 说的是全范围、实际像素却被压到 16~235 */
+            apply_sws_color(e, e->sws_mt[i]);
         }
     }
     if (av_frame_make_writable(e->sw_frame) < 0) {
@@ -640,8 +695,9 @@ int ww_enc_submit_cpu(struct ww_enc *e, const void *ptr, uint32_t fourcc, uint32
 
 #ifdef HAVE_LIBYUV
     uint64_t c0 = enc_now_us();
-    /* libyuv 只有 NV12 输出；4:4:4 走下面的 sws 分带路径 */
-    if (!e->chroma444 &&
+    /* libyuv 只有 NV12 输出，而且固定 BT.601 limited；
+       4:4:4 或 709/full 都走下面的 sws 路径（否则色彩信令与实际像素不一致） */
+    if (!e->chroma444 && e->color == WW_COLOR_601 &&
         ww_argb_to_nv12((const unsigned char *)ptr, (int)stride,
                         e->sw_frame->data[0], e->sw_frame->linesize[0],
                         e->sw_frame->data[1], e->sw_frame->linesize[1],
@@ -708,6 +764,7 @@ int ww_enc_submit_nv12(struct ww_enc *e, const uint8_t *y, int ys,
             if (!e->sws_nv12_444) {
                 return -1;
             }
+            apply_sws_color(e, e->sws_nv12_444);
         }
         if (av_frame_make_writable(f) < 0) {
             return -1;

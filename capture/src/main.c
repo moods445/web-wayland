@@ -144,6 +144,9 @@ struct ww {
     int strategy;
     /* 色度采样：pref 是用户偏好，chroma444 是当前实际生效值 */
     bool chroma_pref, chroma444, chroma444_avail;
+    /* 色彩信令：601 limited（旧行为）/ 709 limited / 709 全范围。
+       原生客户端要求"像本地桌面"，必须用 709 全范围，避免黑白被压。 */
+    int color;
     /* 休眠：没有客户端会话时停抓帧/编码并释放编码器，进程常驻等唤醒。
        网关在会话建立/最后一个会话结束时发 {"t":"active","v":1|0}。 */
     bool active;
@@ -374,9 +377,12 @@ static void caps_write(struct ww *w)
        WW_CURSOR=server 可回退成"光标在视频里"的老行为。 */
     const char *cur = getenv("WW_CURSOR");
     const char *cur_mode = (cur && !strcmp(cur, "server")) ? "server" : "local";
-    fprintf(f, "{\"chroma444\":%d,\"encoder\":\"%s\",\"rc\":\"%s\",\"bitrate_bps\":%lld,\"cursor\":\"%s\"}\n",
+    const char *cs = w->color == WW_COLOR_601 ? "601" : "709";
+    const char *rg = w->color == WW_COLOR_709_FULL ? "full" : "limited";
+    fprintf(f, "{\"chroma444\":%d,\"encoder\":\"%s\",\"rc\":\"%s\",\"bitrate_bps\":%lld,"
+               "\"cursor\":\"%s\",\"color\":\"%s\",\"range\":\"%s\"}\n",
             w->chroma444_avail ? 1 : 0, w->enc_kind ? w->enc_kind : "",
-            w->cbr_avail ? "cbr" : "cqp", (long long)w->bitrate_bps, cur_mode);
+            w->cbr_avail ? "cbr" : "cqp", (long long)w->bitrate_bps, cur_mode, cs, rg);
     fclose(f);
 }
 
@@ -1146,6 +1152,23 @@ static void on_global_remove(void *d, struct wl_registry *r, uint32_t n)
 }
 static const struct wl_registry_listener reg_listener = { .global = on_global, .global_remove = on_global_remove };
 
+/* 统一构造编码器：色度/色彩/码率/编码器种类全部从当前会话状态取，避免各处漏传 */
+static struct ww_enc *make_encoder(struct ww *w, int fw, int fh)
+{
+    struct ww_enc_cfg cfg = {
+        .kind = w->enc_kind,
+        .drm_node = w->drm,
+        .w = fw,
+        .h = fh,
+        .fps = w->fps,
+        .qp = w->qp,
+        .chroma444 = w->chroma444,
+        .bitrate_bps = w->bitrate_bps,
+        .color = w->color,
+    };
+    return ww_enc_create_cfg(&cfg);
+}
+
 /* ── shm 帧回调：编码 + 发送 ─────────────────────────────────── */
 static void on_shm_frame(void *ud, const void *data, uint32_t stride,
                          uint32_t fw, uint32_t fh, uint64_t pts)
@@ -1168,8 +1191,7 @@ static void on_shm_frame(void *ud, const void *data, uint32_t stride,
             ww_enc_destroy(w->enc);
             w->enc = NULL;
         }
-        w->enc = ww_enc_create_full(w->enc_kind, w->drm, (int)fw, (int)fh,
-                                    w->fps, w->qp, w->chroma444, w->bitrate_bps);
+        w->enc = make_encoder(w, (int)fw, (int)fh);
         if (!w->enc) {
             if (encoder_fallback_420(w)) {
                 w->enc_w = w->enc_h = 0;   /* 下一帧按 4:2:0 重建 */
@@ -1241,8 +1263,7 @@ static void on_sc_frame(void *ud, const uint8_t *y, uint32_t ys,
             ww_enc_destroy(w->enc);
             w->enc = NULL;
         }
-        w->enc = ww_enc_create_full(w->enc_kind, w->drm, (int)fw, (int)fh,
-                                    w->fps, w->qp, w->chroma444, w->bitrate_bps);
+        w->enc = make_encoder(w, (int)fw, (int)fh);
         if (!w->enc) {
             if (encoder_fallback_420(w)) {
                 w->enc_w = w->enc_h = 0;   /* 下一帧按 4:2:0 重建 */
@@ -1316,6 +1337,8 @@ int main(int argc, char **argv)
     bool enc_set = false;
     const char *cap_mode = "shm";          /* --capture shm | dmabuf | sc（零拷贝，需 EGL/GL） */
     const char *output_name = "eDP-1";     /* --output：Hyprland 输出名 */
+    bool chroma444_flag = false;           /* --chroma 444：启动即请求 4:4:4 */
+    int color = WW_COLOR_601;              /* --color 601|709|709full */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--drm") && i + 1 < argc) drm = argv[++i];
@@ -1330,6 +1353,15 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--capture") && i + 1 < argc) cap_mode = argv[++i];
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) output_name = argv[++i];
         else if (!strcmp(argv[i], "--enc") && i + 1 < argc) { enc_kind = argv[++i]; enc_set = true; }
+        else if (!strcmp(argv[i], "--chroma") && i + 1 < argc) {
+            chroma444_flag = !strcmp(argv[++i], "444");
+        }
+        else if (!strcmp(argv[i], "--color") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "709")) color = WW_COLOR_709;
+            else if (!strcmp(v, "709full") || !strcmp(v, "full")) color = WW_COLOR_709_FULL;
+            else color = WW_COLOR_601;
+        }
         else if (!strcmp(argv[i], "--max") && i + 1 < argc) {
             unsigned tw = 0, th = 0;
             if (sscanf(argv[++i], "%ux%u", &tw, &th) == 2) { max_w = tw; max_h = th; }
@@ -1391,6 +1423,8 @@ int main(int argc, char **argv)
     w.fps = fps;
     w.qp = qp;
     w.strategy = WW_STRAT_BALANCE;   /* 默认：平衡 */
+    w.color = color;
+    w.chroma_pref = chroma444_flag;
     w.drm = drm;
     w.scale = 1.0;
     w.max_w = max_w;
@@ -1477,11 +1511,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "[cap] 抓帧目标 %ux%u fourcc=0x%x modifier=0x%llx stride=%u\n",
                 w.width, w.height, w.fourcc, (unsigned long long)w.modifier, w.stride);
 
-        w.enc = ww_enc_create_full(enc_kind, drm, (int)w.width, (int)w.height,
-                                   fps, qp, w.chroma444, w.bitrate_bps);
+        w.enc = make_encoder(&w, (int)w.width, (int)w.height);
         if (!w.enc && encoder_fallback_420(&w)) {
-            w.enc = ww_enc_create_full(enc_kind, drm, (int)w.width, (int)w.height,
-                                       fps, qp, false, w.bitrate_bps);
+            w.enc = make_encoder(&w, (int)w.width, (int)w.height);
         }
         if (!w.enc) { fprintf(stderr, "编码器初始化失败\n"); return 1; }
         w.enc_w = w.width;

@@ -21,7 +21,7 @@ static AUDIO_IN: AtomicU64 = AtomicU64::new(0);
 static AUDIO_OUT: AtomicU64 = AtomicU64::new(0);
 static AUDIO_DROPPED: AtomicU64 = AtomicU64::new(0);
 static SESSIONS: AtomicU64 = AtomicU64::new(0);
-static ACTIVE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ACTIVE: AtomicU64 = AtomicU64::new(0);
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 /* /trace-upload 限速用：最近一次真正落盘的时刻（ms），避免多标签页把磁盘刷爆 */
 static LAST_TRACE_UPLOAD_MS: AtomicU64 = AtomicU64::new(0);
@@ -29,10 +29,10 @@ static LAST_TRACE_UPLOAD_MS: AtomicU64 = AtomicU64::new(0);
    INPUT_OWNER 只是「当前操作者」，不是永久的：owner 超过 INPUT_LEASE_MS
    没有输入就把控制权让给别的会话，否则一个没断干净的旧会话（例如异常退出
    的浏览器标签页、自动化测试）会永久占住鼠标，新用户怎么动都没反应。 */
-static INPUT_OWNER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static INPUT_OWNER: AtomicU64 = AtomicU64::new(0);
 /* owner 最近一次发输入的时刻（ms，UNIX_EPOCH 起算） */
-static INPUT_LAST: AtomicU64 = AtomicU64::new(0);
-const INPUT_LEASE_MS: u64 = 1500;
+pub(crate) static INPUT_LAST: AtomicU64 = AtomicU64::new(0);
+pub(crate) const INPUT_LEASE_MS: u64 = 1500;
 
 /* 音频 RED 冗余档位（1=每包带上一帧）。客户端上报丢包率后调整，
    每隔 AUDIO_RED_HOLD_MS 最多改一次，避免在阈值附近来回跳。 */
@@ -51,6 +51,8 @@ use tokio::net::{TcpListener, UnixDatagram};
 use tokio::sync::broadcast;
 use tokio_rustls::TlsAcceptor;
 use wtransport::{Endpoint, Identity, ServerConfig};
+
+mod native;
 
 const PORT: u16 = 8443;
 
@@ -79,7 +81,7 @@ fn ip_allowed(ip: IpAddr) -> bool {
 }
 
 /* 从控制 JSON 里取出 {"t":"xx"} 的类型（够用即可，避免引 JSON 库） */
-fn ctrl_type(msg: &[u8]) -> Option<&[u8]> {
+pub(crate) fn ctrl_type(msg: &[u8]) -> Option<&[u8]> {
     let s = std::str::from_utf8(msg).ok()?;
     let p = s.find("\"t\":\"")? + 5;
     let rest = &s[p..];
@@ -87,7 +89,7 @@ fn ctrl_type(msg: &[u8]) -> Option<&[u8]> {
     Some(&msg[p..p + end])
 }
 
-fn is_input(t: &[u8]) -> bool {
+pub(crate) fn is_input(t: &[u8]) -> bool {
     matches!(t, b"pm" | b"pr" | b"pb" | b"pw" | b"kk")
 }
 
@@ -115,7 +117,7 @@ fn json_num(msg: &[u8], key: &str) -> Option<f64> {
         .ok()
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -482,6 +484,25 @@ async fn main() -> Result<()> {
     let ctrl_addr = ctrl_path.clone();
 
     tokio::spawn(serve_https(acceptor, root));
+
+    /* 原生客户端传输（8444/udp）。与 WebTransport 并存：
+       两者都订阅同一份 wwcap 分片，谁连上谁收，不重复编码。 */
+    {
+        let tx = tx.clone();
+        let tx_audio = tx_audio.clone();
+        let ctrl_sock = ctrl_sock.clone();
+        let ctrl_addr = ctrl_addr.clone();
+        let caps_path = std::env::var("WW_CAPS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp/wwcap-caps.json"));
+        tokio::spawn(async move {
+            if let Err(e) =
+                native::serve(tx, tx_audio, ctrl_sock, ctrl_addr, caps_path).await
+            {
+                eprintln!("[gw] 原生 UDP 传输启动失败: {e}");
+            }
+        });
+    }
 
     /* WebTransport 端点 */
     /* WebTransport 用 13 天自签 ECDSA 证书，配合前端 serverCertificateHashes 钉扎 */
