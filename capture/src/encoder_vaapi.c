@@ -48,8 +48,11 @@ struct ww_enc {
     struct SwsContext *sws;            /* 单线程路径 */
     struct SwsContext *sws_mt[WW_SWS_THREADS];  /* 多线程分带路径 */
     AVFrame *sw_frame;
+    AVFrame *nv12_frame;   /* 零拷贝抓帧路径的 NV12 承载帧（复用，避免每帧分配） */
     bool needs_idr;
     int kind;              /* 0 = vaapi（集显 VDEnc）, 1 = nvenc（独显） */
+    bool chroma444;        /* true = yuv444p（仅 NVENC） */
+    struct SwsContext *sws_nv12_444;   /* 零拷贝 NV12 → YUV444P 回退转换 */
     /* 内部分段耗时（微秒） */
     uint64_t stat_conv_us, stat_up_us, stat_send_us, stat_n;
 };
@@ -184,7 +187,7 @@ static int vpp_convert(struct ww_enc *e, VASurfaceID src, VASurfaceID dst)
 }
 
 /* ── 独显后端：h264_nvenc（软件 NV12 帧直接送入，NVENC 自行上传）── */
-static struct ww_enc *create_nvenc(struct ww_enc *e, int w, int h, int fps, int qp)
+static struct ww_enc *create_nvenc(struct ww_enc *e, int w, int h, int fps, int qp, bool chroma444)
 {
     const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
     if (!codec) {
@@ -193,12 +196,17 @@ static struct ww_enc *create_nvenc(struct ww_enc *e, int w, int h, int fps, int 
     }
     e->kind = 1;
     e->ctx = avcodec_alloc_context3(codec);
+    if (!e->ctx) {
+        fprintf(stderr, "[enc] 分配 nvenc 上下文失败\n");
+        return NULL;
+    }
     e->ctx->width = w;
     e->ctx->height = h;
     e->ctx->time_base = (AVRational){1, 1000000};
     e->ctx->framerate = (AVRational){fps, 1};
-    e->ctx->pix_fmt = AV_PIX_FMT_NV12;
-    e->ctx->profile = FF_PROFILE_H264_HIGH;
+    e->chroma444 = chroma444;
+    e->ctx->pix_fmt = chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_NV12;
+    e->ctx->profile = chroma444 ? FF_PROFILE_H264_HIGH_444_PREDICTIVE : FF_PROFILE_H264_HIGH;
     e->ctx->max_b_frames = 0;
     e->ctx->gop_size = 120;
     /* NVENC 用 priv 的 qp（constqp），不要设 global_quality，否则会告警 */
@@ -217,14 +225,17 @@ static struct ww_enc *create_nvenc(struct ww_enc *e, int w, int h, int fps, int 
 
     if (avcodec_open2(e->ctx, codec, NULL) < 0) {
         fprintf(stderr, "[enc] h264_nvenc 打开失败（QP=%d）\n", qp);
+        /* 不释放会让调用方每帧重建时都泄漏一个 AVCodecContext（含 GPU 资源） */
+        avcodec_free_context(&e->ctx);
         return NULL;
     }
-    fprintf(stderr, "[enc] h264_nvenc 就绪 %dx%d@%d qp=%d (constqp/ull)\n", w, h, fps, qp);
+    fprintf(stderr, "[enc] h264_nvenc 就绪 %dx%d@%d qp=%d 色度=%s (constqp/ull)\n",
+            w, h, fps, qp, chroma444 ? "4:4:4" : "4:2:0");
     return e;
 }
 
-struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
-                                int w, int h, int fps, int qp)
+struct ww_enc *ww_enc_create_chroma(const char *kind, const char *drm_node,
+                                    int w, int h, int fps, int qp, bool chroma444)
 {
     struct ww_enc *e = calloc(1, sizeof(*e));
     if (!e) {
@@ -236,13 +247,18 @@ struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
     e->qp = qp;
 
     if (kind && !strcmp(kind, "nvenc")) {
-        if (!create_nvenc(e, w, h, fps, qp)) {
+        if (!create_nvenc(e, w, h, fps, qp, chroma444)) {
             free(e);
             return NULL;
         }
         return e;
     }
-
+    if (chroma444) {
+        /* HD 630 的 VDEnc 只支持 4:2:0，调用方应先探测再请求 */
+        fprintf(stderr, "[enc] VAAPI 不支持 H.264 4:4:4\n");
+        free(e);
+        return NULL;
+    }
     if (av_hwdevice_ctx_create(&e->hwdev, AV_HWDEVICE_TYPE_VAAPI, drm_node, NULL, 0) < 0) {
         fprintf(stderr, "[enc] 无法创建 VAAPI 设备 %s\n", drm_node);
         free(e);
@@ -255,7 +271,7 @@ struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
 
     e->frames = av_hwframe_ctx_alloc(e->hwdev);
     if (!e->frames) {
-        return NULL;
+        goto fail;
     }
     AVHWFramesContext *fc = (AVHWFramesContext *)e->frames->data;
     fc->format = AV_PIX_FMT_VAAPI;
@@ -265,15 +281,19 @@ struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
     fc->initial_pool_size = 16;
     if (av_hwframe_ctx_init(e->frames) < 0) {
         fprintf(stderr, "[enc] hwframe_ctx_init 失败\n");
-        return NULL;
+        goto fail;
     }
 
     const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");
     if (!codec) {
         fprintf(stderr, "[enc] 找不到 h264_vaapi\n");
-        return NULL;
+        goto fail;
     }
     e->ctx = avcodec_alloc_context3(codec);
+    if (!e->ctx) {
+        fprintf(stderr, "[enc] 分配 vaapi 上下文失败\n");
+        goto fail;
+    }
     e->ctx->width = w;
     e->ctx->height = h;
     e->ctx->time_base = (AVRational){1, 1000000};
@@ -292,8 +312,10 @@ struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
         fprintf(stderr, "[enc] 设置 rc_mode=CQP 失败\n");
     }
     av_opt_set_int(e->ctx->priv_data, "low_power", 1, 0);
-    /* async_depth=1 会把「提交下一帧」与「编码上一帧」串行化；放开后可以重叠 */
-    av_opt_set_int(e->ctx->priv_data, "async_depth", 8, 0);
+    /* async_depth 决定编码器里"在途"的帧数：每多存一帧就多一帧显示延迟。
+       8 帧在 60fps 下等于 ~130ms，鼠标会明显拖尾；1 表示提交后立刻取包，
+       延迟只剩编码本身。1080p VDEnc 单帧编码远小于 16.6ms，吞吐不受影响。 */
+    av_opt_set_int(e->ctx->priv_data, "async_depth", 1, 0);
 
     /* 信令必须与 libyuv 的 ARGBToI420 一致（BT.601 limited），否则解码端按 709 解释会发灰 */
     e->ctx->colorspace = AVCOL_SPC_SMPTE170M;
@@ -303,7 +325,7 @@ struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
 
     if (avcodec_open2(e->ctx, codec, NULL) < 0) {
         fprintf(stderr, "[enc] avcodec_open2 失败（QP=%d）\n", qp);
-        return NULL;
+        goto fail;
     }
 
     if (vpp_init(e) != 0) {
@@ -313,11 +335,65 @@ struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
 
     fprintf(stderr, "[enc] h264_vaapi 就绪 %dx%d@%d qp=%d (VDEnc/CQP)\n", w, h, fps, qp);
     return e;
+
+fail:
+    /* 创建失败必须释放已分配的对象：调用方会每帧重试，
+       漏掉这里会在几十秒内耗尽 DRM fd / 显存，随后 wwcap 永久黑屏 */
+    if (e->ctx) {
+        avcodec_free_context(&e->ctx);
+    }
+    if (e->frames) {
+        av_buffer_unref(&e->frames);
+    }
+    if (e->hwdev) {
+        av_buffer_unref(&e->hwdev);
+    }
+    free(e);
+    return NULL;
+}
+
+struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
+                                int w, int h, int fps, int qp)
+{
+    return ww_enc_create_chroma(kind, drm_node, w, h, fps, qp, false);
 }
 
 struct ww_enc *ww_enc_create(const char *drm_node, int w, int h, int fps, int qp)
 {
     return ww_enc_create_ex("vaapi", drm_node, w, h, fps, qp);
+}
+
+bool ww_enc_probe_444(const char *kind, const char *drm_node)
+{
+    (void)drm_node;
+    if (!kind || strcmp(kind, "nvenc") != 0) {
+        return false;   /* VAAPI 路径恒不支持 */
+    }
+    const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
+    if (!codec) {
+        return false;
+    }
+    AVCodecContext *ctx = avcodec_alloc_context3(codec);
+    if (!ctx) {
+        return false;
+    }
+    ctx->width = 256;
+    ctx->height = 256;
+    ctx->time_base = (AVRational){1, 60};
+    ctx->framerate = (AVRational){60, 1};
+    ctx->pix_fmt = AV_PIX_FMT_YUV444P;
+    ctx->profile = FF_PROFILE_H264_HIGH_444_PREDICTIVE;
+    ctx->max_b_frames = 0;
+    av_opt_set(ctx->priv_data, "preset", "p4", 0);
+    av_opt_set(ctx->priv_data, "tune", "ull", 0);
+    av_opt_set(ctx->priv_data, "rc", "constqp", 0);
+    av_opt_set_int(ctx->priv_data, "qp", 24, 0);
+    bool ok = avcodec_open2(ctx, codec, NULL) >= 0;
+    if (!ok) {
+        fprintf(stderr, "[enc] NVENC 试开 yuv444p 失败：该显卡不支持 H.264 4:4:4\n");
+    }
+    avcodec_free_context(&ctx);
+    return ok;
 }
 
 int ww_enc_submit_dmabuf(struct ww_enc *e, int fd, uint32_t fourcc, uint32_t w, uint32_t h,
@@ -368,7 +444,7 @@ int ww_enc_submit_dmabuf(struct ww_enc *e, int fd, uint32_t fourcc, uint32_t w, 
     return 0;
 }
 
-static int send_sw_frame(struct ww_enc *e, int64_t pts_us, bool force_idr)
+static int send_sw_frame(struct ww_enc *e, AVFrame *sw, int64_t pts_us, bool force_idr)
 {
     uint64_t t0 = enc_now_us();
     AVFrame *f = av_frame_alloc();
@@ -380,7 +456,7 @@ static int send_sw_frame(struct ww_enc *e, int64_t pts_us, bool force_idr)
         return -1;
     }
     uint64_t t1 = enc_now_us();
-    if (av_hwframe_transfer_data(f, e->sw_frame, 0) < 0) {
+    if (av_hwframe_transfer_data(f, sw, 0) < 0) {
         fprintf(stderr, "[enc] NV12 上传失败\n");
         av_frame_free(&f);
         return -1;
@@ -400,6 +476,45 @@ static int send_sw_frame(struct ww_enc *e, int64_t pts_us, bool force_idr)
     return (ret < 0 && ret != AVERROR(EAGAIN)) ? -1 : 0;
 }
 
+/* 复用同一块系统内存帧；色度格式变化（重建编码器）时自动重分配 */
+static AVFrame *ensure_sw_frame(struct ww_enc *e, int fmt)
+{
+    if (e->sw_frame && e->sw_frame->format != fmt) {
+        av_frame_free(&e->sw_frame);
+    }
+    if (!e->sw_frame) {
+        e->sw_frame = av_frame_alloc();
+        if (!e->sw_frame) {
+            return NULL;
+        }
+        e->sw_frame->format = fmt;
+        e->sw_frame->width = e->w;
+        e->sw_frame->height = e->h;
+        if (av_frame_get_buffer(e->sw_frame, 32) < 0) {
+            av_frame_free(&e->sw_frame);
+            return NULL;
+        }
+    }
+    return e->sw_frame;
+}
+
+/* NVENC 直接吃系统内存帧（NV12/YUV444P），由驱动自行上传 */
+static int send_sw_direct(struct ww_enc *e, AVFrame *sw, int64_t pts_us, bool force_idr)
+{
+    sw->pts = pts_us;
+    if (force_idr || e->needs_idr) {
+        sw->pict_type = AV_PICTURE_TYPE_I;
+        sw->flags |= AV_FRAME_FLAG_KEY;
+        e->needs_idr = false;
+    } else {
+        sw->pict_type = AV_PICTURE_TYPE_NONE;
+        sw->flags &= ~AV_FRAME_FLAG_KEY;
+    }
+    int ret = avcodec_send_frame(e->ctx, sw);
+    e->stat_n++;
+    return (ret < 0 && ret != AVERROR(EAGAIN)) ? -1 : 0;
+}
+
 int ww_enc_submit_cpu(struct ww_enc *e, const void *ptr, uint32_t fourcc, uint32_t w, uint32_t h,
                       uint32_t stride, int64_t pts_us, bool force_idr)
 {
@@ -407,19 +522,14 @@ int ww_enc_submit_cpu(struct ww_enc *e, const void *ptr, uint32_t fourcc, uint32
     if (!e || !ptr || w != (uint32_t)e->w || h != (uint32_t)e->h) {
         return -1;
     }
-    if (!e->sw_frame) {
-        e->sw_frame = av_frame_alloc();
-        e->sw_frame->format = AV_PIX_FMT_NV12;
-        e->sw_frame->width = e->w;
-        e->sw_frame->height = e->h;
-        if (av_frame_get_buffer(e->sw_frame, 32) < 0) {
-            return -1;
-        }
+    const int dst_fmt = e->chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_NV12;
+    if (!ensure_sw_frame(e, dst_fmt)) {
+        return -1;
     }
     if (!e->sws_mt[0]) {
         for (int i = 0; i < WW_SWS_THREADS; i++) {
             e->sws_mt[i] = sws_getContext(e->w, e->h, AV_PIX_FMT_BGRA, e->w, e->h,
-                                          AV_PIX_FMT_NV12, SWS_POINT, NULL, NULL, NULL);
+                                          dst_fmt, SWS_POINT, NULL, NULL, NULL);
             if (!e->sws_mt[i]) {
                 fprintf(stderr, "[enc] sws 初始化失败\n");
                 return -1;
@@ -432,27 +542,19 @@ int ww_enc_submit_cpu(struct ww_enc *e, const void *ptr, uint32_t fourcc, uint32
 
 #ifdef HAVE_LIBYUV
     uint64_t c0 = enc_now_us();
-    if (ww_argb_to_nv12((const unsigned char *)ptr, (int)stride,
+    /* libyuv 只有 NV12 输出；4:4:4 走下面的 sws 分带路径 */
+    if (!e->chroma444 &&
+        ww_argb_to_nv12((const unsigned char *)ptr, (int)stride,
                         e->sw_frame->data[0], e->sw_frame->linesize[0],
                         e->sw_frame->data[1], e->sw_frame->linesize[1],
                         e->w, e->h) == 0) {
         e->stat_conv_us += enc_now_us() - c0;
-        e->sw_frame->pts = pts_us;
 
         if (e->kind == 1) {
             /* NVENC 直接吃系统内存 NV12，由它自己上传，无需 hwframe */
-            if (force_idr || e->needs_idr) {
-                e->sw_frame->pict_type = AV_PICTURE_TYPE_I;
-                e->sw_frame->flags |= AV_FRAME_FLAG_KEY;
-                e->needs_idr = false;
-            } else {
-                e->sw_frame->pict_type = AV_PICTURE_TYPE_NONE;
-            }
-            int ret = avcodec_send_frame(e->ctx, e->sw_frame);
-            e->stat_n++;
-            return (ret < 0 && ret != AVERROR(EAGAIN)) ? -1 : 0;
+            return send_sw_direct(e, e->sw_frame, pts_us, force_idr);
         }
-        return send_sw_frame(e, pts_us, force_idr);
+        return send_sw_frame(e, e->sw_frame, pts_us, force_idr);
     }
 #endif
 
@@ -480,8 +582,90 @@ int ww_enc_submit_cpu(struct ww_enc *e, const void *ptr, uint32_t fourcc, uint32
     for (int i = 1; i < WW_SWS_THREADS; i++) {
         pthread_join(th[i], NULL);
     }
-    e->sw_frame->pts = pts_us;
-    return send_sw_frame(e, pts_us, force_idr);
+    if (e->kind == 1) {
+        return send_sw_direct(e, e->sw_frame, pts_us, force_idr);
+    }
+    return send_sw_frame(e, e->sw_frame, pts_us, force_idr);
+}
+
+int ww_enc_submit_nv12(struct ww_enc *e, const uint8_t *y, int ys,
+                       const uint8_t *uv, int uvs,
+                       uint32_t w, uint32_t h, int64_t pts_us, bool force_idr)
+{
+    if (!e || !y || !uv || w != (uint32_t)e->w || h != (uint32_t)e->h) {
+        return -1;
+    }
+    uint64_t t0 = enc_now_us();
+
+    if (e->chroma444) {
+        /* 零拷贝抓帧只产出 NV12，4:4:4 需要一次色度上采样 */
+        AVFrame *f = ensure_sw_frame(e, AV_PIX_FMT_YUV444P);
+        if (!f) {
+            return -1;
+        }
+        if (!e->sws_nv12_444) {
+            e->sws_nv12_444 = sws_getContext(e->w, e->h, AV_PIX_FMT_NV12,
+                                             e->w, e->h, AV_PIX_FMT_YUV444P,
+                                             SWS_POINT, NULL, NULL, NULL);
+            if (!e->sws_nv12_444) {
+                return -1;
+            }
+        }
+        if (av_frame_make_writable(f) < 0) {
+            return -1;
+        }
+        const uint8_t *sp[4] = { y, uv, NULL, NULL };
+        int ss[4] = { ys, uvs, 0, 0 };
+        sws_scale(e->sws_nv12_444, sp, ss, 0, e->h, f->data, f->linesize);
+        e->stat_conv_us += enc_now_us() - t0;
+        if (e->kind == 1) {
+            return send_sw_direct(e, f, pts_us, force_idr);
+        }
+        return send_sw_frame(e, f, pts_us, force_idr);
+    }
+
+    if (!e->nv12_frame) {
+        e->nv12_frame = av_frame_alloc();
+        if (!e->nv12_frame) {
+            return -1;
+        }
+        e->nv12_frame->format = AV_PIX_FMT_NV12;
+        e->nv12_frame->width = e->w;
+        e->nv12_frame->height = e->h;
+        if (av_frame_get_buffer(e->nv12_frame, 32) < 0) {
+            av_frame_free(&e->nv12_frame);
+            return -1;
+        }
+    }
+    AVFrame *f = e->nv12_frame;
+    if (av_frame_make_writable(f) < 0) {
+        return -1;
+    }
+    for (int r = 0; r < e->h; r++) {
+        memcpy(f->data[0] + (size_t)r * f->linesize[0], y + (size_t)r * ys, (size_t)e->w);
+    }
+    for (int r = 0; r < e->h / 2; r++) {
+        memcpy(f->data[1] + (size_t)r * f->linesize[1], uv + (size_t)r * uvs, (size_t)e->w);
+    }
+    e->stat_conv_us += enc_now_us() - t0;
+
+    f->pts = pts_us;
+    if (force_idr || e->needs_idr) {
+        f->pict_type = AV_PICTURE_TYPE_I;
+        f->flags |= AV_FRAME_FLAG_KEY;
+        e->needs_idr = false;
+    } else {
+        f->pict_type = AV_PICTURE_TYPE_NONE;
+        f->flags &= ~AV_FRAME_FLAG_KEY;
+    }
+
+    if (e->kind == 1) {
+        /* NVENC 直接吃系统内存 NV12，由驱动自己上传 */
+        int ret = avcodec_send_frame(e->ctx, f);
+        e->stat_n++;
+        return (ret < 0 && ret != AVERROR(EAGAIN)) ? -1 : 0;
+    }
+    return send_sw_frame(e, f, pts_us, force_idr);
 }
 
 int ww_enc_receive(struct ww_enc *e, struct ww_nal_out *out)
@@ -514,6 +698,23 @@ int ww_enc_receive(struct ww_enc *e, struct ww_nal_out *out)
     }
     memcpy(buf, pkt->data, pkt->size);
 
+    /* 诊断：SPS 里的 profile_idc 才是实际生效的画质档次（244 = 4:4:4） */
+    static int last_prof = -1;
+    for (size_t i = 0; i + 5 < (size_t)pkt->size; i++) {
+        if (pkt->data[i] || pkt->data[i + 1]) continue;
+        size_t off = pkt->data[i + 2] == 1 ? i + 3
+                   : (pkt->data[i + 2] == 0 && pkt->data[i + 3] == 1) ? i + 4 : 0;
+        if (!off || off + 1 >= (size_t)pkt->size) continue;
+        if ((pkt->data[off] & 0x1f) == 7) {
+            int prof = pkt->data[off + 1];
+            if (prof != last_prof) {
+                last_prof = prof;
+                fprintf(stderr, "[enc] 码流 SPS profile_idc=%d\n", prof);
+            }
+            break;
+        }
+    }
+
     out->data = buf;
     out->len = pkt->size;
     out->pts_us = pkt->pts;
@@ -529,6 +730,12 @@ int ww_enc_set_qp(struct ww_enc *e, int qp)
         return 0;
     }
     e->qp = qp;
+    if (e->kind == 1) {
+        /* NVENC 的 constqp 参数在私有的 priv_data 里 */
+        av_opt_set_int(e->ctx->priv_data, "qp", qp, 0);
+        e->needs_idr = true;
+        return 0;
+    }
     e->ctx->flags |= AV_CODEC_FLAG_QSCALE;
     e->ctx->global_quality = qp * FF_QP2LAMBDA;
     /* CQP 下改动 global_quality 需要重建编码器才能稳定生效，这里标记下次强制 IDR 平滑过渡 */
@@ -562,8 +769,14 @@ void ww_enc_destroy(struct ww_enc *e)
             sws_freeContext(e->sws_mt[i]);
         }
     }
+    if (e->sws_nv12_444) {
+        sws_freeContext(e->sws_nv12_444);
+    }
     if (e->sw_frame) {
         av_frame_free(&e->sw_frame);
+    }
+    if (e->nv12_frame) {
+        av_frame_free(&e->nv12_frame);
     }
     free(e);
 }

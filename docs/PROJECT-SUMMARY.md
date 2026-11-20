@@ -36,13 +36,16 @@
 ## 3. 系统架构
 
 ```
-Hyprland 0.55 (集显 card1 / eDP-1；或独显 headless)
-  │  wlr-screencopy + wl_shm（默认，正确抓到画面）
+Hyprland 0.55 (集显 card1 / eDP-1；或独显 headless 4K)
+  │  wlr-screencopy + wl_shm（集显默认，--capture shm）
+  │  wlr-screencopy + dmabuf(tiled)（独显零拷贝，--capture sc，4K60）
   │  ext-image-copy-capture + dmabuf（旧路径，全黑，已弃用）
   ▼
 wwcap (C)
-  ├─ 双 shm 槽位抓帧（抓帧与转码重叠）
-  ├─ sws_scale 4 线程 ARGB→NV12（CPU，因驱动无 VPP）
+  ├─ 双 shm 槽位抓帧（shm 路径，抓帧与转码重叠）
+  ├─ dmabuf → 每帧重建 EGLImage → GL shader 两趟出 Y/UV（sc 路径）
+  ├─ PBO + fence 异步回读 12.4MB NV12（sc 路径）
+  ├─ sws_scale 4 线程 ARGB→NV12（shm 路径，CPU）
   ├─ h264_vaapi（VDEnc/CQP，集显）或 h264_nvenc（constqp/ull/p4，独显）
   ├─ Annex-B 分片：24B 头 + SOCK_DGRAM 发到 wwgw
   └─ 反向：zwp_virtual_keyboard / zwlr_virtual_pointer 注入键鼠
@@ -57,7 +60,7 @@ wwgw (Rust, wtransport)
 web (JS, 无构建)
   ├─ datagram 重组（frame_id + frag_index）
   ├─ WebCodecs VideoDecoder（annexb，codec 由 SPS 推导）
-  ├─ canvas 2D 上屏（等比留黑）+ 自绘光标
+  ├─ canvas 2D 上屏（等比留黑），远端光标随视频帧下发
   ├─ 左上角设置面板（分辨率/帧率/编码器/HUD/全屏）
   └─ window.__ww 自测接口（status/pointer/key/requestKeyframe）
 ```
@@ -72,9 +75,10 @@ web (JS, 无构建)
 | `capture/src/main.c` | 接入 shm 抓帧，新增 `on_shm_frame()`；CLI 参数 `--dump/--enc/--output/--capture/--max`；控制消息 `mode/fps/enc/kf`；灯光 QP 默认值；输出名改用 `w->output_name`；输入几何与初始光标设置；首片/首 AU 日志与分段耗时 |
 | `capture/src/capture_shm.c`（新建）| `ww_shm_create/tick/ready/set_fps/take_cap_ms`；双 shm buffer；`fr_buffer_done()` 后才 `copy()`；本轮加了 screencopy dmabuf 一次性诊断日志 |
 | `capture/src/capture_shm.h`（新建）| shm 抓帧接口与帧回调类型 |
+| `capture/src/capture_sc.c`（新建）| 独显零拷贝抓帧：screencopy dmabuf(tiled) → 每帧重建 EGLImage → GL shader 出 Y/UV → PBO 异步回读 NV12；5 槽位流水线 |
 | `proto/wlr-screencopy-unstable-v1.xml` | 手写协议，补 v3 的 `buffer_done` 事件（否则运行报 `has no event 6`）|
 | `proto/wlr-virtual-pointer-unstable-v1.xml` | 修正 motion/button/axis 时间为**单个 uint**（原错拆 hi/lo，致参数错位）|
-| `capture/meson.build` | 加入 `threads_dep`、`capture_shm.c`、生成的 screencopy 绑定 |
+| `capture/meson.build` | 加入 `threads_dep`、`capture_shm.c`、生成的 screencopy 绑定；`capture_sc.c` 改为可选 `egl`/`gl` 依赖（`-DHAVE_SC_CAPTURE`），去掉 nvcc/ptx |
 | `scripts/gen-protocols.sh` | 增加 screencopy 绑定生成；重新生成修正后的虚拟指针绑定 |
 
 ### 4.2 编码
@@ -105,14 +109,14 @@ web (JS, 无构建)
 | `web/src/main.js` | 证书哈希钉扎；全屏失败不中断启动；`window.__ww` 自测接口；设置面板逻辑（`pref/requestRes/requestFps/autoMode/applyFullscreen`）；HUD fps 窗口裁剪；默认不 pointer lock（`?lock=1` 开启）；关键帧请求节流；端到端估算；本轮修 6 个 bug + 档位断言 |
 | `web/src/decoder.js` | `codecFromAnnexB()` 推导 codec；constraint 归一化 `00`、level 限 5.1；去掉 `prefer-hardware`；等首个 IDR；时间戳严格递增；error 后重建；本轮接 `onNeedKeyframe` |
 | `web/src/transport.js` | 导入 `WIRE_VERSION`；严格校验 version/fragCount/index/payloadLen；`pendingOrder` + LRU 裁剪；控制流未就绪排队；关闭清理；本轮加 `connected` 标志 |
-| `web/src/input.js` | 鼠标按 canvas 实际矩形归一化；自绘光标用 `translate3d`；pointer lock 后先绝对定位对齐；相对移动按 rAF 合并 |
+| `web/src/input.js` | 鼠标按 canvas 实际矩形归一化；pointer lock 后先绝对定位对齐；相对移动按 rAF 合并；**不自绘光标**（screencopy 已把 compositor 光标编进视频，再画一支会出现两个鼠标） |
 | `web/index.html` | 左上角齿轮 + 设置面板：`set-res/set-fps/set-enc/set-hud/set-fs/set-close/set-note` |
-| `web/styles/main.css` | HUD 去 blur 改实色；光标 `transform` + `will-change`；canvas 居中等比；齿轮/设置面板样式 |
+| `web/styles/main.css` | HUD 去 blur 改实色；canvas 居中等比；齿轮/设置面板样式 |
 
 ### 4.7 脚本与配置
 | 文件 | 改动 |
 |---|---|
-| `scripts/switch-gpu.sh`（新建）| `intel`（card1/eDP-1/vaapi/3200x1800）与 `nvidia`（card0/headless/nvenc/3840x2160）互斥切换 |
+| `scripts/switch-gpu.sh`（新建）| `intel`（card1/headless 1080p/vaapi/3200x1800）与 `nvidia`（card0/headless 4K/nvenc/3840x2160）互斥切换 |
 | `scripts/run-all.sh` / `stop-all.sh` | 一键启停 Hyprland、网关、抓帧编码 |
 | `scripts/cdp-shot.mjs` / `e2e-test.mjs` | CDP 截图与端到端断言工具 |
 | `scripts/regression-test.mjs`（新建）| 15 项全功能回归 |
@@ -197,9 +201,26 @@ web (JS, 无构建)
 4K 单帧：screencopy/shm 回读 ~46ms + CPU 转换 ~12ms + 编码 ~0ms。
 结论：**瓶颈在 GPU→CPU 回读与 CPU 色彩转换，不在编码器**。
 
-### 6.3 4K60 两大硬障碍
-1. **dmabuf 抓帧全黑**：`--capture dmabuf` 落盘 PPM 单色全 0，加 `DMA_BUF_IOCTL_SYNC` 也无效。
-2. **VAAPI VPP 不可用**：`vaCreateConfig(VPP)` 失败；screencopy 虽提供 dmabuf（实测 `fmt=0x34325241` ARGB8888），但无法在 GPU 上做 ARGB→NV12，只能 CPU 回退。
+### 6.3 4K60 已达成（独显零拷贝路径）
+
+`wwcap --capture sc --enc nvenc --output HEADLESS-2 --max 3840x2160`：
+
+| 指标 | 实测 |
+|---|---|
+| 帧率 | **59.6 ~ 60.2 fps**（16s 稳态）|
+| GL 转换 | 0.5ms/帧 |
+| PBO 回读拷贝 | ~1.5ms/帧 |
+| 抓帧延迟 | ~40ms（compositor 每刷新周期只服务一个 screencopy，队列压 ~2.4 帧）|
+
+管线：screencopy dmabuf(tiled) → 每帧重建 EGLImage → 两趟 GL shader（Y=R8、UV=RG8 半尺寸）→ PBO 异步回读 NV12 → NVENC。
+
+关键结论（详见 `docs/streaming-conclusions.md` 第 5 节）：
+1. **EGLImage 必须每帧销毁重建**，复用会冻结在挂接时刻。
+2. **回读必须异步**：同步 `glReadPixels` 每帧多花 ~12ms，帧率掉到 45fps。
+3. **请求要压队列**：按 1:1 节拍发请求会因抖动漏刷新点，掉到 50 出头；5 槽位才稳定 60。
+4. **CUDA 互操作弃用**：`cuGraphicsMapResources` 在 4K tiled 纹理上 detile 需 18~26ms/帧；`cuImportExternalMemory` 直接报错。
+
+旧的 shm 路径（4K 22fps）保留为集显回退。
 
 ---
 
@@ -220,27 +241,30 @@ web (JS, 无构建)
 
 ## 8. 当前状态与已知限制
 
-**当前状态**：集显路径串流稳定 1080p@60fps；所有功能正常；测试全绿；服务端已恢复默认参数。
+**当前状态**：集显路径串流稳定 1080p@60fps；独显零拷贝路径 4K@60fps；所有功能正常；测试全绿。
 
 **已知限制**：
 - 光标形状非真实位图（前端画固定箭头）；`ext_image_copy_capture_cursor_session` 未接入。
 - 自适应控制器仅 QP 单旋钮；AIMD 与丢包反馈闭环未接（`stats` 已上报，服务端未消费）。
-- 4K 物理极限 ~17–23fps。
-- 音频、剪贴板、文件传输不在本期范围。
+- 4K60 只在独显 `--capture sc` 路径达成；集显 shm 路径 4K 仍 ~22fps。
+- NVENC 仍是从主机内存 NV12 上传（PBO 回读后 memcpy），尚未做显存直连。
+- 音频只做下行（PipeWire monitor → Opus → AudioWorklet）；麦克风上行、剪贴板、文件传输不在本期范围。
+- 音频码率固定 64kbps，不做 ABR；仅按客户端上报丢包率开关 RED 冗余（见 README 音频章节）。
 - 该工作区**不是 git 仓库**，`git status` 不可用。
 
 ---
 
-## 9. 待决策事项（方案 A：4K60）
+## 9. 方案 A：4K60 落地记录
 
-是否投入**全 GPU 零拷贝管线**重写。路线：
-1. `scripts/switch-gpu.sh nvidia` 把桌面迁独显（headless 已验证能创建，但 wwcap 是否真正用 nvenc 未最终确认）。
-2. 抓帧改 screencopy dmabuf / EGL-dmabuf 直导，替代 shm 回读。
-3. 色彩转换走 CUDA/NPP 或 NVENC 原生路径，全程留 GPU。
-4. NVENC 直连显存编码（后端已就绪，但 `ww_enc_submit_cpu()` 是系统内存上传，需新增 dmabuf→CUDA 上传）。
-5. 保留集显 `--enc vaapi` + shm 回退；两条路径互斥（seatd 同 seat 只允许一个 Hyprland）。
+原计划的五步已全部完成：
 
-这是重写抓帧→转换→编码管线的工程，不是配置问题；是否推进需产品侧决策。
+1. `scripts/switch-gpu.sh nvidia` 把桌面迁到独显 headless 输出（4K@60），并自动带 `--capture sc --enc nvenc`。
+2. 抓帧改 screencopy dmabuf，EGL 直接导入 tiled 纹理（不走 shm 回读）。
+3. 色彩转换在 GL shader 里做（BT.601 limited），替换原计划的 CUDA/NPP。
+4. NVENC 编码（`h264_nvenc`，Annex-B）。
+5. 集显 `--capture shm --enc vaapi` 保留为回退；两条路径互斥（seatd 同 seat 只允许一个 Hyprland）。
+
+与原计划的偏差：CUDA 路径实测不可用（detile 18~26ms/帧），改为 GL shader；当前 NVENC 输入仍是主机内存 NV12，显存直连为后续可选优化。
 
 ---
 
@@ -248,7 +272,8 @@ web (JS, 无构建)
 
 - `XDG_RUNTIME_DIR=/run/user/1000`、`WAYLAND_DISPLAY=wayland-1`、Hyprland 实例签名取 `$XDG_RUNTIME_DIR/hypr/` 最新目录。
 - 网关 `wwgw`（cwd 必须是项目根）静态托管 `web/`，HTTPS+WebTransport 均 :8443；前端 JS 改动即时生效，C 代码需 `cd capture/build && meson compile`。
-- 抓帧命令：`wwcap --video /run/user/1000/ww-video.sock --ctrl /run/user/1000/wwcap-ctrl.sock --enc vaapi --output eDP-1 --max 3200x1800`，日志 `/tmp/wwcap.log`。
+- 抓帧命令：`wwcap --video /run/user/1000/ww-video.sock --ctrl /run/user/1000/wwcap-ctrl.sock --capture shm --enc vaapi --output HEADLESS-1 --max 3200x1800`，日志 `/tmp/wwcap.log`。
+- 物理屏 eDP-1 只广播 3840x2160（60/48Hz），不能配成 1080p（会变成 0x0 而抓不到帧）；串流一律抓 headless 输出，`hyprland.conf` 里 eDP-1 用 `preferred`。
 - 控制协议：Unix DGRAM `wwcap-ctrl.sock`，一条报文一条 JSON（如 `{"t":"kk","k":125,"d":1}`）。
 
 **约束（用户明确要求，2026-11-10，已写入项目根 `AGENTS.md`）**：禁止用 curl/Python 脚本批量抓取网页或调 API 抓数据；必须用浏览器自动化（agent-browser/playwright/chrome-use）；同时打开的网页不超过 4 个。本地 e2e/CDP 验证属于自动化测试，与此不冲突。

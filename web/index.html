@@ -7,56 +7,227 @@
 <link rel="stylesheet" href="/styles/main.css" />
 </head>
 <body>
-  <!-- 串流层：全屏画布 + 光标层，进入后不得有任何装饰 -->
+  <!-- 串流层：全屏画布。远端光标已随视频帧一起编码，前端不再自绘第二支 -->
   <div id="stage" class="hidden">
     <canvas id="screen"></canvas>
-    <div id="cursor" class="cursor hidden"></div>
 
     <!-- 客户端串流设置（只影响本机这条连接，不改远端桌面配置） -->
     <button id="gear" class="gear" title="串流设置">&#9881;</button>
     <div id="settings" class="settings hidden">
       <div class="settings-title">串流设置</div>
 
-      <label class="settings-row">
-        <span>分辨率</span>
-        <select id="set-res">
-          <option value="auto">自动（跟随窗口）</option>
-          <option value="1920x1080">1920 × 1080</option>
-          <option value="2560x1440">2560 × 1440</option>
-          <option value="3200x1800">3200 × 1800</option>
-          <option value="3840x2160">3840 × 2160（4K）</option>
-        </select>
-      </label>
+      <section class="settings-group">
+        <h3>分辨率与帧率</h3>
 
-      <label class="settings-row">
-        <span>帧率</span>
-        <select id="set-fps">
-          <option value="0">自动</option>
-          <option value="30">30 fps</option>
-          <option value="45">45 fps</option>
-          <option value="60">60 fps</option>
-        </select>
-      </label>
+        <div class="settings-row col">
+          <span class="row-head">
+            <span>串流策略</span>
+            <output id="set-strategy-out">平衡</output>
+          </span>
+          <div class="seg" id="set-strategy" role="group" aria-label="串流策略">
+            <button type="button" data-strategy="1">流畅优先</button>
+            <button type="button" class="active" data-strategy="0">平衡</button>
+            <button type="button" data-strategy="2">画质优先</button>
+          </div>
+          <small id="set-strategy-note">平衡：QP 20，兼顾清晰与流畅。</small>
+        </div>
 
-      <label class="settings-row">
-        <span>编码器</span>
-        <select id="set-enc">
-          <option value="vaapi">集显 VAAPI（省电）</option>
-          <option value="nvenc">独显 NVENC（更快）</option>
-        </select>
-      </label>
+        <label class="settings-row">
+          <span>分辨率</span>
+          <select id="set-res">
+            <option value="auto">自动（跟随窗口）</option>
+            <option value="1920x1080">1920 × 1080</option>
+            <option value="2560x1440">2560 × 1440</option>
+            <option value="3200x1800">3200 × 1800</option>
+            <option value="3840x2160">3840 × 2160（4K）</option>
+          </select>
+        </label>
 
-      <label class="settings-row check">
-        <span>状态叠层</span>
-        <input type="checkbox" id="set-hud">
-      </label>
+        <label class="settings-row">
+          <span>帧率</span>
+          <select id="set-fps">
+            <option value="0">自动</option>
+            <option value="30">30 fps</option>
+            <option value="45">45 fps</option>
+            <option value="60">60 fps</option>
+          </select>
+        </label>
+
+        <label class="settings-row col">
+          <span class="row-head">
+            <span>画质</span>
+            <output id="set-qp-out">QP 20 · — Mbps</output>
+          </span>
+          <input type="range" id="set-qp" min="0" max="100" step="1" aria-label="画质">
+          <small>向右更清晰。本机仅支持 CQP，码率随画面复杂度浮动。</small>
+        </label>
+      </section>
+
+      <!-- 音频：整机混音（默认 sink 的 monitor）→ Opus → 浏览器播放 -->
+      <section class="settings-group">
+        <h3>音频</h3>
+
+        <label class="settings-row col">
+          <span class="row-head">
+            <span>我的音量</span>
+            <output id="set-vol-out">100%</output>
+          </span>
+          <input type="range" id="set-vol" min="0" max="100" step="1" aria-label="我的音量">
+          <small>只影响本机播放，不改目标机扬声器音量。</small>
+        </label>
+
+        <label class="settings-row check">
+          <span>串流开始时静音目标计算机扬声器</span>
+          <input type="checkbox" id="set-mute-host">
+        </label>
+
+        <label class="settings-row check">
+          <span>失去焦点时静音</span>
+          <input type="checkbox" id="set-mute-blur">
+        </label>
+
+        <label class="settings-row">
+          <span>音频状态</span>
+          <output id="set-audio-state">未连接</output>
+        </label>
+      </section>
+
+      <section class="settings-group">
+        <h3>界面设置</h3>
+
+        <label class="settings-row">
+          <span>显示方式</span>
+          <select id="set-fit">
+            <option value="fill">自适应铺满窗口</option>
+            <option value="pixel">原始像素（不放大）</option>
+          </select>
+        </label>
+
+        <label class="settings-row">
+          <span>显示模式</span>
+          <select id="set-mode">
+            <option value="window">窗口</option>
+            <option value="fullscreen">全屏</option>
+          </select>
+        </label>
+
+        <label class="settings-row check">
+          <span>状态叠层</span>
+          <input type="checkbox" id="set-hud">
+        </label>
+
+        <label class="settings-row check">
+          <span>统计信息</span>
+          <input type="checkbox" id="set-stats">
+        </label>
+
+        <label class="settings-row check">
+          <span>显示连接质量警告</span>
+          <input type="checkbox" id="set-quality">
+        </label>
+      </section>
+
+      <section class="settings-group">
+        <h3>高级设置</h3>
+
+        <label class="settings-row">
+          <span>视频解码器</span>
+          <select id="set-decode">
+            <option value="auto">自动（推荐）</option>
+            <option value="hardware">优先硬件解码</option>
+            <option value="software">优先软件解码</option>
+          </select>
+        </label>
+
+        <label class="settings-row">
+          <span>视频编码器</span>
+          <select id="set-enc">
+            <option value="">跟随服务端</option>
+            <option value="vaapi">集显 VAAPI（省电）</option>
+            <option value="nvenc">独显 NVENC（更快）</option>
+          </select>
+        </label>
+
+        <label class="settings-row check muted">
+          <span>启用 HDR <em>暂未支持</em></span>
+          <input type="checkbox" disabled>
+        </label>
+
+        <label class="settings-row check" id="set-chroma-row">
+          <span>色度采样 4:4:4 <em id="set-chroma-note"></em></span>
+          <input type="checkbox" id="set-chroma">
+        </label>
+        <small id="set-chroma-hint">每个像素独立颜色信息，文字/红蓝边缘更锐利；码率约 +30~50%。</small>
+      </section>
+
+      <!-- 画面卡住 / 黑屏时的自救：先重启采集，多次无效再重启桌面会话 -->
+      <section class="settings-group">
+        <h3>串流控制</h3>
+
+        <label class="settings-row col">
+          <span class="row-head">
+            <span>画面卡住或黑屏</span>
+            <output id="set-restart-note">—</output>
+          </span>
+          <span class="settings-btns">
+            <button id="btn-restart" class="mini" type="button">重启采集</button>
+            <button id="btn-restart-deep" class="mini danger" type="button">强制恢复桌面</button>
+          </span>
+          <small>「重启采集」重建抓帧与编码，桌面里的程序都会保留；仍不出图再用「强制恢复桌面」，它会重启整个桌面会话（窗口会关闭，需刷新页面重连）。</small>
+        </label>
+      </section>
 
       <div class="settings-actions">
-        <button id="set-fs" class="mini">切换全屏</button>
+        <button id="set-help" class="mini ghost">快捷键帮助</button>
         <button id="set-close" class="mini ghost">关闭</button>
       </div>
 
       <div class="settings-note" id="set-note">—</div>
+    </div>
+    <div id="warn" class="warn hidden"></div>
+    <div id="stats" class="stats hidden" aria-live="off"></div>
+
+    <div id="help" class="help hidden">
+      <div class="help-card" role="dialog" aria-modal="true" aria-label="帮助与快捷键">
+        <div class="help-head">
+          <span>帮助与快捷键</span>
+          <button id="help-close" class="rep-close" title="关闭">&times;</button>
+        </div>
+
+        <section class="help-section">
+          <h4>键盘</h4>
+          <dl class="help-list">
+            <div><dt><kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>F1</kbd></dt><dd>显示 / 隐藏统计信息</dd></div>
+            <div><dt><kbd>Esc</kbd></dt><dd>退出全屏（由浏览器接管）</dd></div>
+            <div><dt><kbd>F11</kbd></dt><dd>浏览器全屏切换</dd></div>
+          </dl>
+        </section>
+
+        <section class="help-section">
+          <h4>鼠标</h4>
+          <dl class="help-list">
+            <div><dt>左键 / 右键 / 中键</dt><dd>发送到远程桌面</dd></div>
+            <div><dt>滚轮</dt><dd>远程滚动</dd></div>
+            <div><dt>按住拖动</dt><dd>远程拖拽；移出画面后停止发送移动</dd></div>
+          </dl>
+        </section>
+
+        <section class="help-section">
+          <h4>统计信息字段</h4>
+          <dl class="help-list help-stats">
+            <div><dt>Video stream</dt><dd>当前分辨率、渲染帧率与解码格式</dd></div>
+            <div><dt>Incoming frame rate from network</dt><dd>每秒从网络收齐并交给解码器的帧数</dd></div>
+            <div><dt>Decoding / Rendering frame rate</dt><dd>解码输出帧率与实际绘制上屏帧率</dd></div>
+            <div><dt>Host processing latency</dt><dd>服务端采集 + 编码耗时；协议暂无该时间戳，显示 -</dd></div>
+            <div><dt>Frames dropped by your network connection</dt><dd>分片缺失导致整帧无法重组的比例</dd></div>
+            <div><dt>Frames dropped due to network jitter</dt><dd>迟到 / 乱序被丢弃的帧比例</dd></div>
+            <div><dt>Average network latency</dt><dd>控制流 ping/pong 往返时延及方差</dd></div>
+            <div><dt>Average decoding time</dt><dd>入队到解码输出，扣除排队等待后的耗时</dd></div>
+            <div><dt>Average frame queue delay</dt><dd>解码队列中等待的估算时长</dd></div>
+            <div><dt>Average rendering time</dt><dd>drawImage 绘制耗时，不含浏览器垂直同步等待</dd></div>
+          </dl>
+        </section>
+      </div>
     </div>
     <div id="hud" class="hud hidden">
       <div class="hud-title">串流状态</div>
@@ -94,6 +265,14 @@
       <div class="actions">
         <button id="enter" class="primary">进入桌面</button>
         <button id="enter-fs" class="ghost">全屏进入</button>
+      </div>
+
+      <div id="report" class="report hidden">
+        <div class="report-head">
+          <span>本次连接质量报告</span>
+          <button id="report-close" class="rep-close" title="关闭">&times;</button>
+        </div>
+        <dl id="report-list"></dl>
       </div>
 
       <ul class="errors hidden" id="errors"></ul>

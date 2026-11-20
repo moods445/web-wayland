@@ -1,5 +1,8 @@
 // 分辨率帧率实测：逐档切换分辨率，采样前端渲染 fps 与服务端耗时
 // 用法: node scripts/perf-test.mjs [cdpPort]
+// 用例说明（分类 / 前置 / 步骤 / 预期）：../docs/TEST-CASES.md
+//   性能与延迟   ../docs/TEST-CASES.md#h-性能与延迟
+//   分辨率协商   ../docs/TEST-CASES.md#d-分辨率协商
 import { spawn } from 'node:child_process';
 
 const port = Number(process.argv[2] || 9224);

@@ -10,18 +10,22 @@ wwcap (C)
   ├─ gbm 分配 dmabuf + zwp_linux_dmabuf_v1 包成 wl_buffer
   ├─ ARGB→NV12：该驱动无 VPP，走 libswscale（CPU）
   ├─ NV12 上传到 VAAPI 表面 → h264_vaapi（VDEnc / low_power / CQP）
-  ├─ Annex-B 访问单元按 1100B 切片，写 24B 头后 SOCK_DGRAM 发到 wwgw
+  ├─ Annex-B 访问单元按 1100B 切片，写 24B 头后 SOCK_DGRAM 发到 wwgw（ww-video.sock）
+  ├─ PipeWire 默认 sink 的 monitor → Opus 48k/立体声/20ms → 16B 头（首字节 2）+ RED 冗余
+  │    → ww-audio.sock（独立 socket，避免排在视频分片后面）
   └─ 反向：virtual-keyboard / virtual-pointer 注入键鼠
   ▼ Unix DGRAM
 wwgw (Rust, wtransport)
-  ├─ 8443/udp  WebTransport：视频走 datagram 广播，控制走双向流
+  ├─ 8443/udp  WebTransport：视频/音频都走 datagram 广播（首字节 1=视频、2=音频），控制走双向流
   ├─ 8443/tcp  HTTPS 静态托管（仅 http/1.1 ALPN）
   ├─ 192.168.0.0/24 白名单（含 IPv4-mapped IPv6 归一）
-  └─ 新会话建立即向 wwcap 发 {"t":"kf"} 强制 IDR
+  ├─ 新会话建立即向 wwcap 发 {"t":"kf"} 与 {"t":"astream","rx":1}
+  └─ astats 丢包反馈 → {"t":"ared"} 开关 RED 冗余
   ▼ WebTransport
 web (JS, 无构建)
-  ├─ datagram 重组（frame_id + frag_index）
+  ├─ datagram 按首字节分流：1 → 视频重组（frame_id + frag_index），2 → 音频包
   ├─ WebCodecs VideoDecoder（annexb，codec 由 SPS 推导）
+  ├─ WebCodecs AudioDecoder(opus) → AudioWorklet 环形缓冲（40ms 起，自适应 ≤120ms）
   ├─ canvas 2D 上屏（drawImage(VideoFrame)，等比留黑）
   └─ 键鼠捕获 → 控制流回传
 ```

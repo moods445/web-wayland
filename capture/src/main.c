@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <linux/dma-buf.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/sysmacros.h>
 #include <sys/un.h>
@@ -32,6 +34,10 @@
 #include <wayland-client.h>
 
 #include "capture_shm.h"
+#ifdef HAVE_SC_CAPTURE
+#include "capture_sc.h"
+#endif
+#include "audio.h"
 #include "encoder.h"
 #include "input.h"
 #include "generated/ext-image-capture-source-v1.h"
@@ -41,10 +47,26 @@
 #include "generated/wlr-virtual-pointer-unstable-v1.h"
 #include "../../proto/wire.h"
 
+/* 输出探测：Wayland 里 wl_output 的全局顺序不等于 Hyprland 的输出顺序，
+   eDP-1 可能排在前面（且模式可能是 0x0）。这里按 --output 名字精确挑一个。 */
+#define WW_MAX_OUT 8
+struct out_probe {
+    struct wl_output *o;
+    struct ww *w;
+    uint32_t gname;
+    char name[64];
+};
+
 struct ww {
     struct wl_display *dpy;
     struct wl_registry *reg;
     struct wl_output *output;
+    struct out_probe probes[WW_MAX_OUT];
+    int n_probes;
+    /* 新输出绑定后需要一次 roundtrip 才能拿到初始 mode/scale */
+    bool layout_dirty;
+    /* 上一次同步给输入模块的布局，用于避免重复日志 */
+    int in_ox, in_oy, in_ow, in_oh, in_lw, in_lh;
     struct wl_seat *seat;
     struct ext_output_image_capture_source_manager_v1 *source_mgr;
     struct ext_image_copy_capture_manager_v1 *capture_mgr;
@@ -71,10 +93,17 @@ struct ww {
     struct ww_input *input;
     struct ww_shm *shm;
     bool use_shm;
+#ifdef HAVE_SC_CAPTURE
+    struct ww_sc *sc;      /* --capture sc：screencopy dmabuf → EGL/GL → NV12 */
+#endif
 
     int video_fd;
     struct sockaddr_un video_addr;
     int ctrl_fd;
+
+    /* 音频：--audio 未给出时为 NULL，整条音频链路保持关闭 */
+    struct ww_audio *aud;
+    int audio_fd;
 
     uint32_t frame_id;
     uint64_t capture_ts_us;
@@ -91,6 +120,9 @@ struct ww {
     const char *drm;
     double scale;
     uint32_t enc_w, enc_h;   /* 编码器当前尺寸，用于判断是否需要重建 */
+    uint64_t enc_retry_at;   /* 编码器创建失败后的重试时间（避免逐帧重建） */
+    bool preset_applied;     /* 是否已经成功下发过一次 hyprctl 输出模式 */
+    uint32_t tgt_w, tgt_h;   /* 最近一次期望的输出尺寸，用于校验实际抓帧尺寸 */
     bool auto_adapt;         /* 自动升降档（用户手动锁定分辨率时关闭） */
     uint32_t def_max_w, def_max_h;
     int def_fps;
@@ -102,13 +134,33 @@ struct ww {
     double req_scale;
     int cur_preset, max_preset;
     uint64_t slow_since, fast_since;
+    /* 串流策略：只调 QP 与目标帧率，永不改动分辨率 */
+    int strategy;
+    /* 色度采样：pref 是用户偏好，chroma444 是当前实际生效值 */
+    bool chroma_pref, chroma444, chroma444_avail;
+    /* 休眠：没有客户端会话时停抓帧/编码并释放编码器，进程常驻等唤醒。
+       网关在会话建立/最后一个会话结束时发 {"t":"active","v":1|0}。 */
+    bool active;
+    bool suspended;
+    uint64_t idle_since_us;   /* 最后一个客户端离开的时刻；0 表示当前有会话 */
 };
+
+enum { WW_STRAT_BALANCE = 0, WW_STRAT_SMOOTH = 1, WW_STRAT_QUALITY = 2, WW_STRAT_CUSTOM = 3 };
 
 static uint64_t now_us(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+/* 收到 SIGTERM 时先走正常清理（销毁虚拟键盘/指针），
+   否则进程被直接杀掉，Hyprland 可能因设备突然消失而崩溃。 */
+static volatile sig_atomic_t g_stop;
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_stop = 1;
 }
 
 /* CPU 读 dmabuf 前必须做缓存同步，否则读到的是陈旧/零数据（画面全黑的根因） */
@@ -120,8 +172,6 @@ static void dmabuf_sync(int fd, uint64_t flags)
 
 /* 一次性把当前映射的 ARGB 落成 PPM，用于验证抓到的像素是否正确 */
 static void dump_ppm_once(struct ww *w);
-
-static uint64_t now_us_(void) { return now_us(); }
 
 /* ── 极小 JSON 取值（够用即可，避免引入解析库）───────────────── */
 static const char *json_find(const char *s, const char *key)
@@ -187,11 +237,177 @@ static void apply_preset(struct ww *w, int pi)
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
              "hyprctl keyword monitor %s,%ux%u@60,0x0,%.2f >/dev/null 2>&1", w->output_name, pw, ph, sc);
+    /* 相同档位重复下发会让 hyprctl 阻塞输入处理，并触发一次无谓的模式切换 */
+    double ds = sc - w->scale;
+    if (ds < 0) ds = -ds;
+    if (w->preset_applied && pi == w->cur_preset && ds < 0.01) {
+        return;
+    }
     if (system(cmd) == 0) {
         w->cur_preset = pi;
         w->scale = sc;
+        w->preset_applied = true;
+        w->tgt_w = pw;
+        w->tgt_h = ph;
         fprintf(stderr, "[cap] 输出 %ux%u scale=%.2f（逻辑 %.0fx%.0f，档位%d）\n",
                 pw, ph, sc, logical_w, logical_w * ph / pw, pi);
+    }
+}
+
+/* ── 目标机扬声器静音（客户端「串流开始时静音目标机」开关）────────
+   走 wpctl，和 config/hypr/hyprland.conf 里的音量快捷键同一套语义：
+   项目本身不解析音量，只把用户意图转给 PipeWire。原状态只在第一次
+   静音前记录，会话结束/进程退出时恢复，避免把桌面永久静音。 */
+static int g_sink_saved_mute = -1;
+
+static void sink_mute_apply(int on)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd),
+             "wpctl set-mute @DEFAULT_AUDIO_SINK@ %d >/dev/null 2>&1", on ? 1 : 0);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "[aud] wpctl 执行失败（wpctl 不可用？）\n");
+    }
+}
+
+static void sink_mute_set(int on)
+{
+    if (g_sink_saved_mute < 0) {
+        FILE *p = popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
+        if (p) {
+            char buf[256] = {0};
+            if (fgets(buf, sizeof(buf), p)) {
+                g_sink_saved_mute = strstr(buf, "MUTED") ? 1 : 0;
+            }
+            pclose(p);
+        }
+        if (g_sink_saved_mute < 0) {
+            g_sink_saved_mute = 0;   /* 读不到就按「未静音」处理，恢复时不会误静音 */
+        }
+    }
+    sink_mute_apply(on);
+    fprintf(stderr, "[aud] 目标机扬声器 -> %s（原状态 %s）\n",
+            on ? "静音" : "未静音", g_sink_saved_mute ? "静音" : "未静音");
+}
+
+static void sink_mute_restore(void)
+{
+    if (g_sink_saved_mute < 0) {
+        return;
+    }
+    sink_mute_apply(g_sink_saved_mute);
+    fprintf(stderr, "[aud] 目标机扬声器已恢复原状态（%s）\n",
+            g_sink_saved_mute ? "静音" : "未静音");
+    g_sink_saved_mute = -1;
+}
+
+/* ── 串流策略与色度采样 ───────────────────────────────────────── */
+
+static int strategy_preset_qp(int s)
+{
+    switch (s) {
+    case WW_STRAT_SMOOTH:  return 26;   /* 24~30 之间按实测帧率浮动 */
+    case WW_STRAT_QUALITY: return 16;
+    case WW_STRAT_BALANCE: return 20;
+    default:               return -1;   /* 自定义：不动 QP */
+    }
+}
+
+/* 供网关 /capabilities 读取：客户端据此置灰 4:4:4 开关 */
+static void caps_write(struct ww *w)
+{
+    const char *path = getenv("WW_CAPS_PATH");
+    if (!path || !*path) {
+        path = "/tmp/wwcap-caps.json";
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "{\"chroma444\":%d,\"encoder\":\"%s\"}\n",
+            w->chroma444_avail ? 1 : 0, w->enc_kind ? w->enc_kind : "");
+    fclose(f);
+}
+
+/* 改动编码参数（QP / 色度）后立刻重建，下一帧用新参数并强制 IDR */
+static void encoder_restart(struct ww *w)
+{
+    if (w->enc) {
+        ww_enc_destroy(w->enc);
+        w->enc = NULL;
+    }
+    w->enc_w = 0;
+    w->enc_h = 0;
+    w->enc_retry_at = 0;
+    w->need_idr = true;
+}
+
+/* 探测当前编码器的 4:4:4 能力，并让实际生效值跟随用户偏好 */
+static void chroma_refresh(struct ww *w)
+{
+    bool avail = ww_enc_probe_444(w->enc_kind, w->drm);
+    bool want = w->chroma_pref && avail;
+
+    if (avail != w->chroma444_avail) {
+        fprintf(stderr, "[enc] 4:4:4 %s（编码器 %s）\n",
+                avail ? "可用" : "不可用", w->enc_kind ? w->enc_kind : "?");
+    }
+    w->chroma444_avail = avail;
+    if (want != w->chroma444) {
+        w->chroma444 = want;
+        fprintf(stderr, "[enc] 色度采样 -> %s\n", want ? "4:4:4" : "4:2:0");
+        encoder_restart(w);
+    }
+    caps_write(w);
+}
+
+/* 真实分辨率下 4:4:4 打不开（探测只试了 256x256）时回退 4:2:0，避免画面直接卡死 */
+static bool encoder_fallback_420(struct ww *w)
+{
+    if (!w->chroma444) {
+        return false;
+    }
+    fprintf(stderr, "[enc] 4:4:4 编码器创建失败，自动回退 4:2:0\n");
+    w->chroma444 = false;
+    w->chroma444_avail = false;
+    caps_write(w);
+    return true;
+}
+
+/* 策略只改 QP 与目标帧率，分辨率由客户端下拉单独决定 */
+static void apply_strategy(struct ww *w, int s)
+{
+    if (s < WW_STRAT_BALANCE || s > WW_STRAT_CUSTOM) {
+        return;
+    }
+    w->strategy = s;
+
+    int qp = strategy_preset_qp(s);
+    if (qp > 0) {
+        w->qp = qp;
+    }
+
+    if (s == WW_STRAT_SMOOTH && w->fps != 30 && w->fps != 60) {
+        w->fps = 60;
+        if (w->shm) {
+            ww_shm_set_fps(w->shm, 60);
+        }
+#ifdef HAVE_SC_CAPTURE
+        if (w->sc) {
+            ww_sc_set_fps(w->sc, 60);
+        }
+#endif
+    }
+
+    if (qp > 0) {
+        /* NVENC 的 constqp 打开后不保证动态生效，重建最稳 */
+        encoder_restart(w);
+        fprintf(stderr, "[cap] 策略 -> %s（QP %d，目标 %d fps）\n",
+                s == WW_STRAT_SMOOTH ? "流畅优先"
+                : s == WW_STRAT_QUALITY ? "画质优先" : "平衡",
+                w->qp, w->fps);
+    } else {
+        fprintf(stderr, "[cap] 策略 -> 自定义（QP %d）\n", w->qp);
     }
 }
 
@@ -200,8 +416,8 @@ static void handle_ctrl(struct ww *w, const char *msg)
     const char *t = strstr(msg, "\"t\":\"");
     if (!t) return;
     t += 5;
-    char type[8] = {0};
-    for (int i = 0; i < 7 && t[i] && t[i] != '"'; i++) type[i] = t[i];
+    char type[32] = {0};
+    for (int i = 0; i < 31 && t[i] && t[i] != '"'; i++) type[i] = t[i];
 
     if (strcmp(type, "pm") == 0) {
         ww_input_motion_abs(w->input, jnum(msg, "x", 0), jnum(msg, "y", 0));
@@ -214,9 +430,24 @@ static void handle_ctrl(struct ww *w, const char *msg)
     } else if (strcmp(type, "kk") == 0) {
         ww_input_key(w->input, (uint32_t)jnum(msg, "k", 0), jnum(msg, "d", 0) > 0);
     } else if (strcmp(type, "qp") == 0) {
+        /* 手动调 QP -> 进入「自定义」，策略不再覆盖 */
+        w->strategy = WW_STRAT_CUSTOM;
         w->qp = (int)jnum(msg, "v", w->qp);
         ww_enc_set_qp(w->enc, w->qp);
-        fprintf(stderr, "[cap] QP -> %d\n", w->qp);
+        fprintf(stderr, "[cap] QP -> %d（自定义）\n", w->qp);
+    } else if (strcmp(type, "strategy") == 0) {
+        apply_strategy(w, (int)jnum(msg, "v", WW_STRAT_BALANCE));
+    } else if (strcmp(type, "chroma") == 0) {
+        w->chroma_pref = jnum(msg, "v", 0) > 0;
+        chroma_refresh(w);
+    } else if (strcmp(type, "active") == 0) {
+        /* 会话存续通知：没人看就不必抓帧编码（30 秒后进入休眠，见主循环） */
+        bool on = jnum(msg, "v", 0) > 0;
+        if (on != w->active) {
+            w->active = on;
+            w->idle_since_us = on ? 0 : now_us();
+            fprintf(stderr, "[cap] 客户端会话%s\n", on ? "接入" : "全部断开");
+        }
     } else if (strcmp(type, "fps") == 0) {
         int v = (int)jnum(msg, "v", 0);
         if (v == 0) {
@@ -224,18 +455,54 @@ static void handle_ctrl(struct ww *w, const char *msg)
         }
         if (v > 0 && v <= 120 && w->shm) {
             ww_shm_set_fps(w->shm, v);
+            w->fps = v;   /* 自适应升降档要按用户选择的目标帧率判断 */
             fprintf(stderr, "[cap] 采集帧率设为 %d fps\n", v);
         }
+#ifdef HAVE_SC_CAPTURE
+        if (v > 0 && v <= 120 && w->sc) {
+            ww_sc_set_fps(w->sc, v);
+            w->fps = v;
+            fprintf(stderr, "[cap] 采集帧率设为 %d fps\n", v);
+        }
+#endif
+    } else if (strcmp(type, "keysreset") == 0) {
+        /* 客户端断开/刷新：补发全部释放，避免 SUPER/CTRL 卡死在桌面 */
+        ww_input_reset(w->input);
+    } else if (strcmp(type, "astream") == 0) {
+        /* 客户端/网关声明是否需要下行音频：没人听就停采集，别空跑编码器 */
+        bool rx = jnum(msg, "rx", 0) > 0;
+        if (w->aud) {
+            ww_audio_set_enabled(w->aud, rx);
+            fprintf(stderr, "[aud] 下行音频 %s\n", rx ? "开启" : "关闭");
+        }
+    } else if (strcmp(type, "ared") == 0) {
+        /* 冗余档位：0 关闭，>=1 每包带上一帧（网关按客户端丢包反馈下调/上调） */
+        if (w->aud) {
+            int n = (int)jnum(msg, "n", 1);
+            ww_audio_set_redundancy(w->aud, n);
+            fprintf(stderr, "[aud] RED 冗余 -> %d\n", n > 0 ? 1 : 0);
+        }
+    } else if (strcmp(type, "mute") == 0) {
+        sink_mute_set(jnum(msg, "on", 0) > 0);
     } else if (strcmp(type, "enc") == 0) {
         char v[16];
         if (jstr(msg, "v", v, sizeof(v)) && strcmp(v, w->enc_kind) != 0) {
-            const char *kind = (!strcmp(v, "nvenc")) ? "nvenc" : "vaapi";
-            fprintf(stderr, "[cap] 切换编码器 %s -> %s\n", w->enc_kind, kind);
-            w->enc_kind = kind;
-            /* 下一帧发现尺寸不符时会自动销毁重建 —— 这里把基准清掉即可 */
-            w->enc_w = 0;
-            w->enc_h = 0;
-            w->need_idr = true;
+#ifdef HAVE_SC_CAPTURE
+            if (w->sc && strcmp(v, "nvenc") != 0) {
+                fprintf(stderr, "[cap] 零拷贝抓帧只支持 nvenc，忽略 %s\n", v);
+            } else
+#endif
+            {
+                const char *kind = (!strcmp(v, "nvenc")) ? "nvenc" : "vaapi";
+                fprintf(stderr, "[cap] 切换编码器 %s -> %s\n", w->enc_kind, kind);
+                w->enc_kind = kind;
+                /* 下一帧发现尺寸不符时会自动销毁重建 —— 这里把基准清掉即可 */
+                w->enc_w = 0;
+                w->enc_h = 0;
+                w->need_idr = true;
+                /* 换编码器会改变 4:4:4 能力：集显不支持时自动回退 4:2:0 */
+                chroma_refresh(w);
+            }
         }
     } else if (strcmp(type, "kf") == 0) {
         w->need_idr = true;
@@ -251,6 +518,10 @@ static void handle_ctrl(struct ww *w, const char *msg)
                      "hyprctl keyword monitor %s,1920x1080@60,0x0,1 >/dev/null 2>&1", w->output_name);
             if (system(cmd) == 0) {
                 w->scale = 1.0;
+                w->cur_preset = 0;
+                w->preset_applied = true;
+                w->tgt_w = 1920;
+                w->tgt_h = 1080;
                 fprintf(stderr, "[cap] 无客户端，输出恢复 1920x1080@1x\n");
             }
             return;
@@ -301,6 +572,10 @@ static void on_buffer_size(void *data, struct ext_image_copy_capture_session_v1 
     (void)s;
     struct ww *ww = data;
     ww->width = w; ww->height = h; ww->size_known = true;
+    if (ww->tgt_w && (w != ww->tgt_w || h != ww->tgt_h)) {
+        fprintf(stderr, "[cap] 警告：实际输出 %ux%u ≠ 期望 %ux%u（hyprctl 可能拒绝了该模式）\n",
+                w, h, ww->tgt_w, ww->tgt_h);
+    }
     fprintf(stderr, "[cap] buffer_size %ux%u\n", w, h);
 }
 
@@ -517,12 +792,132 @@ static void on_buf_release(void *d, struct wl_buffer *b) { (void)d; (void)b; }
 static const struct wl_buffer_listener buf_listener = { .release = on_buf_release };
 
 /* ── registry ────────────────────────────────────────────────── */
+/* 把抓帧输出在布局中的逻辑位置/尺寸与整个布局尺寸同步给输入模块。
+   zwlr_virtual_pointer 的 motion_absolute 是**整个布局**的归一化坐标，不是
+   单输出坐标；多显示器时不做这层换算，光标会跑到别的屏（视频里看不到光标、
+   点击位置也会错位）。
+
+   布局信息用 hyprctl 读，而不是 wl_output 的 geometry/mode：
+   Hyprland 给新建的 headless 输出发的 geometry 一直是 0,0，按它算会把
+   第二块屏当成叠在同一位置，坐标仍然错。 */
+static void update_input_layout(struct ww *w)
+{
+    if (!w->input) return;
+    FILE *fp = popen("hyprctl monitors 2>/dev/null", "r");
+    if (!fp) return;
+
+    char line[512], name[64] = "";
+    int mw = 0, mh = 0, mx = 0, my = 0;
+    double sc = 1.0;
+    bool in_mon = false;
+    int ox = -1, oy = 0, ow = 0, oh = 0, lw = 0, lh = 0;
+
+    while (fgets(line, sizeof line, fp)) {
+        if (!strncmp(line, "Monitor ", 8)) {
+            name[0] = 0; mw = mh = mx = my = 0; sc = 1.0;
+            in_mon = sscanf(line + 8, "%63s", name) == 1;
+            char *colon = strchr(name, ':');
+            if (colon) *colon = 0;
+        } else if (in_mon) {
+            if (sscanf(line, " %dx%d@%*f at %dx%d", &mw, &mh, &mx, &my) == 4) {
+                continue;
+            }
+            if (sscanf(line, " scale: %lf", &sc) != 1) continue;
+            int lwid = (int)(mw / sc + 0.5);
+            int lhei = (int)(mh / sc + 0.5);
+            in_mon = false;
+            if (lwid <= 0 || lhei <= 0) continue;   /* 禁用/未就绪的输出不计入布局 */
+            if (mx + lwid > lw) lw = mx + lwid;
+            if (my + lhei > lh) lh = my + lhei;
+            if (w->output_name && !strcmp(name, w->output_name)) {
+                ox = mx; oy = my; ow = lwid; oh = lhei;
+            }
+        }
+    }
+    pclose(fp);
+
+    /* 找不到输出名（例如 hyprctl 不可用）时按单屏兜底，与旧行为一致 */
+    if (ox < 0) { ox = 0; oy = 0; ow = (int)w->width; oh = (int)w->height; }
+    if (lw <= 0) lw = ox + ow;
+    if (lh <= 0) lh = oy + oh;
+    if (ox != w->in_ox || oy != w->in_oy || ow != w->in_ow || oh != w->in_oh ||
+        lw != w->in_lw || lh != w->in_lh) {
+        fprintf(stderr, "[input] 布局 %d,%d %dx%d（总 %dx%d）\n", ox, oy, ow, oh, lw, lh);
+        w->in_ox = ox; w->in_oy = oy; w->in_ow = ow; w->in_oh = oh;
+        w->in_lw = lw; w->in_lh = lh;
+    }
+    ww_input_set_layout(w->input, ox, oy, ow, oh, lw, lh);
+}
+
+/* wl_output 的几何/模式/缩放只当“布局可能变了”的触发信号：
+   Hyprland 下这几个值本身不可靠，真正的位置/尺寸以 hyprctl 为准。 */
+static void ob_geometry(void *d, struct wl_output *o, int32_t x, int32_t y, int32_t pw, int32_t ph,
+                        int32_t subpixel, const char *make, const char *model, int32_t transform)
+{
+  struct out_probe *p = d;
+  (void)o; (void)x; (void)y; (void)pw; (void)ph; (void)subpixel;
+  (void)make; (void)model; (void)transform;
+  update_input_layout(p->w);
+}
+static void ob_mode(void *d, struct wl_output *o, uint32_t flags, int32_t w, int32_t h, int32_t r)
+{
+  struct out_probe *p = d;
+  (void)o; (void)flags; (void)w; (void)h; (void)r;
+  update_input_layout(p->w);
+}
+static void ob_scale(void *d, struct wl_output *o, int32_t f)
+{
+  struct out_probe *p = d;
+  (void)o; (void)f;
+  update_input_layout(p->w);
+}
+static void ob_desc(void *d, struct wl_output *o, const char *s) { (void)d; (void)o; (void)s; }
+
+static void ob_name(void *d, struct wl_output *o, const char *name)
+{
+    (void)o;
+    struct out_probe *p = d;
+    snprintf(p->name, sizeof(p->name), "%s", name ? name : "");
+}
+
+/* done 在 v4 里是最后一条事件，此时 name 已知，可以按 --output 匹配 */
+static void ob_done(void *d, struct wl_output *o)
+{
+    (void)o;
+    struct out_probe *p = d;
+    struct ww *w = p->w;
+    if (w->output) return;
+    const char *want = w->output_name;
+    if (want && *want) {
+        if (!p->name[0] || strcmp(p->name, want) != 0) return;
+    }
+    w->output = p->o;
+    update_input_layout(w);
+}
+
+static const struct wl_output_listener out_listener = {
+    .geometry = ob_geometry,
+    .mode = ob_mode,
+    .done = ob_done,
+    .scale = ob_scale,
+    .name = ob_name,
+    .description = ob_desc,
+};
+
 static void on_global(void *data, struct wl_registry *r, uint32_t name, const char *iface,
                       uint32_t ver)
 {
     struct ww *w = data;
     if (!strcmp(iface, wl_output_interface.name)) {
-        if (!w->output) w->output = wl_registry_bind(r, name, &wl_output_interface, ver >= 4 ? 4 : ver);
+        if (w->n_probes >= WW_MAX_OUT) return;
+        struct out_probe *p = &w->probes[w->n_probes++];
+        memset(p, 0, sizeof(*p));
+        p->w = w;
+        p->gname = name;
+        p->o = wl_registry_bind(r, name, &wl_output_interface, ver >= 4 ? 4 : ver);
+        wl_output_add_listener(p->o, &out_listener, p);
+        w->layout_dirty = true;
+        fprintf(stderr, "[cap] 发现输出 global=%u（共 %d 个）\n", name, w->n_probes);
     } else if (!strcmp(iface, wl_seat_interface.name)) {
         if (!w->seat) w->seat = wl_registry_bind(r, name, &wl_seat_interface, ver >= 5 ? 5 : ver);
     } else if (!strcmp(iface, ext_output_image_capture_source_manager_v1_interface.name)) {
@@ -537,7 +932,22 @@ static void on_global(void *data, struct wl_registry *r, uint32_t name, const ch
         w->ptrmgr = wl_registry_bind(r, name, &zwlr_virtual_pointer_manager_v1_interface, ver >= 2 ? 2 : 1);
     }
 }
-static void on_global_remove(void *d, struct wl_registry *r, uint32_t n) { (void)d; (void)r; (void)n; }
+static void on_global_remove(void *d, struct wl_registry *r, uint32_t n)
+{
+    struct ww *w = d;
+    (void)r;
+    for (int i = 0; i < w->n_probes; i++) {
+        if (w->probes[i].gname != n) continue;
+        /* 输出被移除后必须立刻缩回布局，否则输入坐标会按已经不存在的屏幕换算 */
+        if (w->probes[i].o == w->output) w->output = NULL;
+        wl_output_destroy(w->probes[i].o);
+        memmove(&w->probes[i], &w->probes[i + 1],
+                (size_t)(w->n_probes - i - 1) * sizeof(w->probes[0]));
+        w->n_probes--;
+        w->layout_dirty = true;
+        break;
+    }
+}
 static const struct wl_registry_listener reg_listener = { .global = on_global, .global_remove = on_global_remove };
 
 /* ── shm 帧回调：编码 + 发送 ─────────────────────────────────── */
@@ -552,18 +962,29 @@ static void on_shm_frame(void *ud, const void *data, uint32_t stride,
 
     /* 分辨率变化（协商或手动切换）：以「编码器实际尺寸」为准判断，避免状态错位 */
     if (fw != w->enc_w || fh != w->enc_h) {
+        /* 创建失败不能逐帧重试：每帧都会泄漏一次 ffmpeg/DRM 资源，几十秒就耗尽 fd */
+        if (!w->enc && now_us() < w->enc_retry_at) {
+            return;
+        }
         fprintf(stderr, "[cap] 帧尺寸 %ux%u，编码器 %ux%u → 重建\n",
                 fw, fh, w->enc_w, w->enc_h);
         if (w->enc) {
             ww_enc_destroy(w->enc);
             w->enc = NULL;
         }
-        w->enc = ww_enc_create_ex(w->enc_kind, w->drm, (int)fw, (int)fh, w->fps, w->qp);
+        w->enc = ww_enc_create_chroma(w->enc_kind, w->drm, (int)fw, (int)fh,
+                                      w->fps, w->qp, w->chroma444);
         if (!w->enc) {
-            fprintf(stderr, "[cap] 编码器重建失败（%ux%u）\n", fw, fh);
+            if (encoder_fallback_420(w)) {
+                w->enc_w = w->enc_h = 0;   /* 下一帧按 4:2:0 重建 */
+                return;
+            }
+            fprintf(stderr, "[cap] 编码器重建失败（%ux%u），1 秒后重试\n", fw, fh);
             w->enc_w = w->enc_h = 0;
+            w->enc_retry_at = now_us() + 1000000;
             return;
         }
+        w->enc_retry_at = 0;
         w->enc_w = fw;
         w->enc_h = fh;
         w->width = fw;
@@ -584,6 +1005,8 @@ static void on_shm_frame(void *ud, const void *data, uint32_t stride,
 
     if (ww_enc_submit_cpu(w->enc, data, w->fourcc, w->width, w->height, stride,
                           (int64_t)pts, idr) != 0) {
+        /* IDR 请求不能丢：提交失败时保留标记，否则客户端要等下一个 GOP 才恢复 */
+        w->need_idr = w->need_idr || idr;
         static bool logged;
         if (!logged) {
             logged = true;
@@ -604,6 +1027,75 @@ static void on_shm_frame(void *ud, const void *data, uint32_t stride,
     w->last_frame_us = t_end;
 }
 
+/* ── 零拷贝帧回调：NV12 已由 CUDA 转换好，直接送编码器 ────────── */
+#ifdef HAVE_SC_CAPTURE
+static void on_sc_frame(void *ud, const uint8_t *y, uint32_t ys,
+                        const uint8_t *uv, uint32_t uvs,
+                        uint32_t fw, uint32_t fh, uint64_t pts, double conv_ms)
+{
+    struct ww *w = ud;
+
+    if (fw != w->enc_w || fh != w->enc_h) {
+        if (!w->enc && now_us() < w->enc_retry_at) {
+            return;
+        }
+        fprintf(stderr, "[cap] 帧尺寸 %ux%u，编码器 %ux%u → 重建\n",
+                fw, fh, w->enc_w, w->enc_h);
+        if (w->enc) {
+            ww_enc_destroy(w->enc);
+            w->enc = NULL;
+        }
+        w->enc = ww_enc_create_chroma(w->enc_kind, w->drm, (int)fw, (int)fh,
+                                      w->fps, w->qp, w->chroma444);
+        if (!w->enc) {
+            if (encoder_fallback_420(w)) {
+                w->enc_w = w->enc_h = 0;   /* 下一帧按 4:2:0 重建 */
+                return;
+            }
+            fprintf(stderr, "[cap] 编码器重建失败（%ux%u），1 秒后重试\n", fw, fh);
+            w->enc_w = w->enc_h = 0;
+            w->enc_retry_at = now_us() + 1000000;
+            return;
+        }
+        w->enc_retry_at = 0;
+        w->enc_w = fw;
+        w->enc_h = fh;
+        w->width = fw;
+        w->height = fh;
+        ww_input_set_geometry(w->input, (int)fw, (int)fh);
+        w->need_idr = true;
+    }
+
+    w->capture_ts_us = pts;
+
+    bool idr = w->need_idr;
+    w->need_idr = false;
+
+    if (ww_enc_submit_nv12(w->enc, y, (int)ys, uv, (int)uvs, fw, fh,
+                           (int64_t)pts, idr) != 0) {
+        w->need_idr = w->need_idr || idr;
+        static bool logged;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "[cap] submit_nv12 失败（frame=%ux%u enc=%p）\n",
+                    fw, fh, (void *)w->enc);
+        }
+        return;
+    }
+
+    uint64_t t_conv = now_us();
+    struct ww_nal_out out;
+    while (ww_enc_receive(w->enc, &out) == 1) {
+        send_packet(w, &out);
+    }
+    uint64_t t_end = now_us();
+    w->acc_conv_us += (uint64_t)(conv_ms * 1000.0);
+    w->acc_enc_us += t_end - t_conv;
+    w->acc_n++;
+    w->last_frame_us = t_end;
+}
+#endif
+
 /* ── main ────────────────────────────────────────────────────── */
 static void mkaddr(struct sockaddr_un *a, const char *path)
 {
@@ -615,31 +1107,56 @@ static void mkaddr(struct sockaddr_un *a, const char *path)
 int main(int argc, char **argv)
 {
     const char *drm = "/dev/dri/renderD129";
+    const char *gbm_node = "/dev/dri/card1";
+    bool gbm_set = false;
     const char *video_path = NULL;
     const char *ctrl_path = NULL;
+    const char *audio_path = NULL;   /* --audio：不给就整条音频链路关闭 */
     int qp = 20, fps = 60;   /* CQP 是唯一可调项：20 明显比默认值清晰，码率仍可接受 */
     bool dump_once = false;
     uint32_t max_w = 3200, max_h = 1800;   /* 默认上限：本机 4K 回读撑不住 30fps */
     const char *enc_kind = "vaapi";        /* 默认集显；--enc nvenc 走独显 */
-    bool cap_dmabuf = false;               /* --capture dmabuf：走 ext-capture 的 dmabuf 通路 */
+    bool enc_set = false;
+    const char *cap_mode = "shm";          /* --capture shm | dmabuf | sc（零拷贝，需 EGL/GL） */
     const char *output_name = "eDP-1";     /* --output：Hyprland 输出名 */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--drm") && i + 1 < argc) drm = argv[++i];
+        else if (!strcmp(argv[i], "--gbm") && i + 1 < argc) { gbm_node = argv[++i]; gbm_set = true; }
         else if (!strcmp(argv[i], "--video") && i + 1 < argc) video_path = argv[++i];
         else if (!strcmp(argv[i], "--ctrl") && i + 1 < argc) ctrl_path = argv[++i];
+        else if (!strcmp(argv[i], "--audio") && i + 1 < argc) audio_path = argv[++i];
         else if (!strcmp(argv[i], "--qp") && i + 1 < argc) qp = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) fps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump")) dump_once = true;
-        else if (!strcmp(argv[i], "--capture") && i + 1 < argc) cap_dmabuf = !strcmp(argv[++i], "dmabuf");
+        else if (!strcmp(argv[i], "--capture") && i + 1 < argc) cap_mode = argv[++i];
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) output_name = argv[++i];
+        else if (!strcmp(argv[i], "--enc") && i + 1 < argc) { enc_kind = argv[++i]; enc_set = true; }
         else if (!strcmp(argv[i], "--max") && i + 1 < argc) {
             unsigned tw = 0, th = 0;
             if (sscanf(argv[++i], "%ux%u", &tw, &th) == 2) { max_w = tw; max_h = th; }
         }
     }
+    bool cap_dmabuf = !strcmp(cap_mode, "dmabuf");
+    bool cap_sc = !strcmp(cap_mode, "sc");
+#ifndef HAVE_SC_CAPTURE
+    if (cap_sc) {
+        fprintf(stderr, "本版本未编译零拷贝抓帧后端（缺 EGL/GL）\n");
+        return 2;
+    }
+#endif
+#ifdef HAVE_SC_CAPTURE
+    /* 零拷贝路径只走独显：默认 gbm 节点与编码器都跟着切到 NVIDIA */
+    if (cap_sc && !enc_set) {
+        enc_kind = "nvenc";
+    }
+    if (cap_sc && !gbm_set) {
+        gbm_node = "/dev/dri/card0";
+    }
+#endif
     if (!video_path || !ctrl_path) {
-        fprintf(stderr, "用法: wwcap --video <sock> --ctrl <sock> [--drm node] [--qp N] [--fps N]\n");
+        fprintf(stderr, "用法: wwcap --video <sock> --ctrl <sock> [--audio <sock>] "
+                        "[--drm node] [--qp N] [--fps N]\n");
         return 2;
     }
 
@@ -670,8 +1187,12 @@ int main(int argc, char **argv)
 
     struct ww w;
     memset(&w, 0, sizeof(w));
+    /* -1 保证第一次算出的布局一定会同步/打日志 */
+    w.in_ox = w.in_oy = w.in_ow = w.in_oh = w.in_lw = w.in_lh = -1;
+    w.audio_fd = -1;
     w.fps = fps;
     w.qp = qp;
+    w.strategy = WW_STRAT_BALANCE;   /* 默认：平衡 */
     w.drm = drm;
     w.scale = 1.0;
     w.max_w = max_w;
@@ -690,67 +1211,89 @@ int main(int argc, char **argv)
     w.reg = wl_display_get_registry(w.dpy);
     wl_registry_add_listener(w.reg, &reg_listener, &w);
     wl_display_roundtrip(w.dpy);
-    if (!w.source_mgr || !w.capture_mgr || !w.dmabuf || !w.output) {
-        fprintf(stderr, "缺少必需的 Wayland 全局对象\n");
+    wl_display_roundtrip(w.dpy);   /* 第二次：等 wl_output 的 name / done */
+    if (!w.output && w.n_probes > 0) {
+        fprintf(stderr, "[cap] 未找到输出 %s，退回第一个 wl_output\n", output_name);
+        w.output = w.probes[0].o;
+    }
+    if (!w.output) {
+        fprintf(stderr, "缺少 wl_output\n");
         return 1;
     }
 
-    /* gbm（与 compositor 同卡） */
-    const char *nodes[] = { "/dev/dri/card1", "/dev/dri/renderD129", NULL };
-    for (int i = 0; nodes[i] && !w.gbm; i++) {
-        int fd = open(nodes[i], O_RDWR | O_CLOEXEC);
-        if (fd < 0) continue;
-        w.gbm = gbm_create_device(fd);
-        if (!w.gbm) close(fd);
-    }
-    if (!w.gbm) { fprintf(stderr, "gbm 初始化失败\n"); return 1; }
+    /* 默认走 screencopy+shm：不需要 ext-capture / gbm。--capture dmabuf 才走扩展通路 */
+    w.use_shm = !cap_dmabuf && !cap_sc;
 
-    w.source = ext_output_image_capture_source_manager_v1_create_source(w.source_mgr, w.output);
-    w.session = ext_image_copy_capture_manager_v1_create_session(w.capture_mgr, w.source, 0);
-    ext_image_copy_capture_session_v1_add_listener(w.session, &session_listener, &w);
-    while (!w.session_ready && wl_display_dispatch(w.dpy) != -1) {}
-    if (!w.size_known || !w.fourcc) { fprintf(stderr, "session 协商失败\n"); return 1; }
-
-    uint32_t flags = (w.modifier == 0) ? GBM_BO_USE_LINEAR : 0;
-    w.bo = gbm_bo_create(w.gbm, w.width, w.height, w.fourcc, flags);
-    if (!w.bo) { fprintf(stderr, "gbm_bo_create 失败\n"); return 1; }
-    w.stride = gbm_bo_get_stride(w.bo);
-    w.dmabuf_fd = gbm_bo_get_fd(w.bo);
-    if (w.dmabuf_fd < 0) { fprintf(stderr, "gbm_bo_get_fd 失败\n"); return 1; }
-
-    /* 常驻 CPU 映射：VPP 不可用时用它做色彩转换（不 unmap，规避 mesa 26 的 unmap 崩溃） */
-    if (w.modifier == 0) {
-        uint32_t mstride = 0;
-        w.cpu_map = gbm_bo_map(w.bo, 0, 0, w.width, w.height,
-                               GBM_BO_TRANSFER_READ | GBM_BO_TRANSFER_WRITE, &mstride, &w.cpu_map);
-        if (w.cpu_map) {
-            w.stride = mstride;
-            fprintf(stderr, "[cap] CPU 映射就绪 stride=%u\n", mstride);
-        } else {
-            fprintf(stderr, "[cap] CPU 映射失败，走 dmabuf 路径\n");
+    if (cap_dmabuf) {
+        if (!w.source_mgr || !w.capture_mgr || !w.dmabuf) {
+            fprintf(stderr, "缺少 ext-image-copy-capture 全局对象\n");
+            return 1;
         }
+        /* gbm（与 compositor 同卡） */
+        const char *nodes[] = { gbm_node, "/dev/dri/card1", "/dev/dri/card0", NULL };
+        for (int i = 0; nodes[i] && !w.gbm; i++) {
+            int fd = open(nodes[i], O_RDWR | O_CLOEXEC);
+            if (fd < 0) continue;
+            w.gbm = gbm_create_device(fd);
+            if (!w.gbm) close(fd);
+        }
+        if (!w.gbm) { fprintf(stderr, "gbm 初始化失败\n"); return 1; }
+
+        w.source = ext_output_image_capture_source_manager_v1_create_source(w.source_mgr, w.output);
+        w.session = ext_image_copy_capture_manager_v1_create_session(w.capture_mgr, w.source, 0);
+        ext_image_copy_capture_session_v1_add_listener(w.session, &session_listener, &w);
+        while (!w.session_ready && wl_display_dispatch(w.dpy) != -1) {}
+        if (!w.size_known || !w.fourcc) { fprintf(stderr, "session 协商失败\n"); return 1; }
+
+        uint32_t flags = (w.modifier == 0) ? GBM_BO_USE_LINEAR : 0;
+        w.bo = gbm_bo_create(w.gbm, w.width, w.height, w.fourcc, flags);
+        if (!w.bo) { fprintf(stderr, "gbm_bo_create 失败\n"); return 1; }
+        w.stride = gbm_bo_get_stride(w.bo);
+        w.dmabuf_fd = gbm_bo_get_fd(w.bo);
+        if (w.dmabuf_fd < 0) { fprintf(stderr, "gbm_bo_get_fd 失败\n"); return 1; }
+
+        /* 常驻 CPU 映射：VPP 不可用时用它做色彩转换（不 unmap，规避 mesa 26 的 unmap 崩溃） */
+        if (w.modifier == 0) {
+            uint32_t mstride = 0;
+            w.cpu_map = gbm_bo_map(w.bo, 0, 0, w.width, w.height,
+                                   GBM_BO_TRANSFER_READ | GBM_BO_TRANSFER_WRITE, &mstride, &w.cpu_map);
+            if (w.cpu_map) {
+                w.stride = mstride;
+                fprintf(stderr, "[cap] CPU 映射就绪 stride=%u\n", mstride);
+            } else {
+                fprintf(stderr, "[cap] CPU 映射失败，走 dmabuf 路径\n");
+            }
+        }
+
+        struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(w.dmabuf);
+        zwp_linux_buffer_params_v1_add(params, w.dmabuf_fd, 0, 0, w.stride,
+                                       (uint32_t)(w.modifier >> 32), (uint32_t)(w.modifier & 0xffffffffu));
+        w.wl_buf = zwp_linux_buffer_params_v1_create_immed(params, w.width, w.height, w.fourcc, 0);
+        zwp_linux_buffer_params_v1_destroy(params);
+        if (!w.wl_buf) { fprintf(stderr, "wl_buffer 创建失败\n"); return 1; }
+        wl_buffer_add_listener(w.wl_buf, &buf_listener, &w);
+
+        fprintf(stderr, "[cap] 抓帧目标 %ux%u fourcc=0x%x modifier=0x%llx stride=%u\n",
+                w.width, w.height, w.fourcc, (unsigned long long)w.modifier, w.stride);
+
+        w.enc = ww_enc_create_chroma(enc_kind, drm, (int)w.width, (int)w.height,
+                                     fps, qp, w.chroma444);
+        if (!w.enc && encoder_fallback_420(&w)) {
+            w.enc = ww_enc_create_chroma(enc_kind, drm, (int)w.width, (int)w.height,
+                                         fps, qp, false);
+        }
+        if (!w.enc) { fprintf(stderr, "编码器初始化失败\n"); return 1; }
+        w.enc_w = w.width;
+        w.enc_h = w.height;
     }
-
-    struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(w.dmabuf);
-    zwp_linux_buffer_params_v1_add(params, w.dmabuf_fd, 0, 0, w.stride,
-                                   (uint32_t)(w.modifier >> 32), (uint32_t)(w.modifier & 0xffffffffu));
-    w.wl_buf = zwp_linux_buffer_params_v1_create_immed(params, w.width, w.height, w.fourcc, 0);
-    zwp_linux_buffer_params_v1_destroy(params);
-    if (!w.wl_buf) { fprintf(stderr, "wl_buffer 创建失败\n"); return 1; }
-    wl_buffer_add_listener(w.wl_buf, &buf_listener, &w);
-
-    fprintf(stderr, "[cap] 抓帧目标 %ux%u fourcc=0x%x modifier=0x%llx stride=%u\n",
-            w.width, w.height, w.fourcc, (unsigned long long)w.modifier, w.stride);
-
-    w.enc = ww_enc_create(drm, (int)w.width, (int)w.height, fps, qp);
-    if (!w.enc) { fprintf(stderr, "编码器初始化失败\n"); return 1; }
-    w.enc_w = w.width;
-    w.enc_h = w.height;
 
     w.input = ww_input_create(w.dpy, w.seat);
     if (w.input) {
         ww_input_attach(w.input, w.kbmgr, w.ptrmgr, w.seat);
-        ww_input_set_geometry(w.input, (int)w.width, (int)w.height);
+        if (w.width && w.height) {
+            ww_input_set_geometry(w.input, (int)w.width, (int)w.height);
+        }
+        update_input_layout(&w);
         FILE *cp = popen("hyprctl cursorpos 2>/dev/null", "r");
         if (cp) {
             char line[64] = {0};
@@ -765,30 +1308,76 @@ int main(int argc, char **argv)
         }
     }
 
-    /* 默认走 screencopy+shm；--capture dmabuf 走 ext-image-copy-capture 的 dmabuf 通路 */
-    w.use_shm = !cap_dmabuf;
-    if (!cap_dmabuf) {
+    if (w.use_shm) {
         w.shm = ww_shm_create(w.dpy, w.output, fps, on_shm_frame, &w);
         if (!w.shm) {
-            fprintf(stderr, "[cap] screencopy 不可用，回退 ext-image-copy-capture\n");
-            w.use_shm = false;
+            fprintf(stderr, "[cap] screencopy 不可用\n");
+            return 1;
         }
     }
 
+#ifdef HAVE_SC_CAPTURE
+    if (cap_sc) {
+        w.sc = ww_sc_create(w.dpy, w.output, gbm_node, fps, on_sc_frame, &w);
+        if (!w.sc) {
+            fprintf(stderr, "[cap] 零拷贝抓帧初始化失败\n");
+            return 1;
+        }
+    }
+#endif
+
+    /* 探测 4:4:4 能力并写出能力文件（网关 /capabilities 读取） */
+    chroma_refresh(&w);
+
     /* IPC */
     w.video_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    /* 默认 SO_SNDBUF 只有 ~200KB，4K 关键帧瞬间就能塞满而整帧丢分片 */
+    int sndbuf = 4 * 1024 * 1024;
+    setsockopt(w.video_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     mkaddr(&w.video_addr, video_path);
 
     w.ctrl_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     struct sockaddr_un ctrl_addr;
     mkaddr(&ctrl_addr, ctrl_path);
+    /* 单实例锁：仅靠 unlink+bind 拦不住第二个进程（它会把旧 socket 文件删掉再绑新路径），
+       结果 Hyprland 里多出一个虚拟指针、旧进程收不到输入。 */
+    char lock_path[512];
+    snprintf(lock_path, sizeof(lock_path), "%s.lock", ctrl_path);
+    int lock_fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+        fprintf(stderr, "[cap] 已有 wwcap 在运行（%s 被占用）\n", lock_path);
+        return 1;
+    }
     unlink(ctrl_path);
     if (bind(w.ctrl_fd, (struct sockaddr *)&ctrl_addr, sizeof(ctrl_addr)) < 0) {
-        fprintf(stderr, "[cap] 绑定 ctrl socket 失败: %s\n", strerror(errno));
+        fprintf(stderr, "[cap] 绑定 ctrl socket 失败: %s（可能已有 wwcap 在运行）\n",
+                strerror(errno));
+        return 1;
     }
 
-    if (submit_frame(&w) != 0) { fprintf(stderr, "首帧提交失败\n"); return 1; }
+    /* 音频：只发不收（上行是二期），因此不需要 bind，也没有额外 poll fd */
+    if (audio_path) {
+        w.audio_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        if (w.audio_fd >= 0) {
+            int abuf = 1024 * 1024;   /* 20ms 一包、每包几百字节，1MB 足够吸收瞬时抖动 */
+            setsockopt(w.audio_fd, SOL_SOCKET, SO_SNDBUF, &abuf, sizeof(abuf));
+            w.aud = ww_audio_create(w.audio_fd, audio_path, WW_AUDIO_BITRATE);
+            if (!w.aud) {
+                fprintf(stderr, "[aud] 初始化失败，串流将没有声音（视频不受影响）\n");
+                close(w.audio_fd);
+                w.audio_fd = -1;
+            }
+        } else {
+            fprintf(stderr, "[aud] 创建音频 socket 失败: %s\n", strerror(errno));
+        }
+    }
+
+    if (cap_dmabuf && submit_frame(&w) != 0) { fprintf(stderr, "首帧提交失败\n"); return 1; }
+    signal(SIGTERM, on_signal);
+    signal(SIGINT, on_signal);
     w.last_frame_us = now_us();
+    /* 启动时默认无会话：30 秒内没人连就休眠，别空转编码器 */
+    w.idle_since_us = w.last_frame_us;
     fprintf(stderr, "[cap] 运行中\n");
 
     struct pollfd pfd[2];
@@ -797,11 +1386,24 @@ int main(int argc, char **argv)
 
     uint64_t stat_t = now_us();
     uint64_t stat_frames = 0;
+    uint64_t aud_pkts_prev = 0, aud_bytes_prev = 0;
 
     for (;;) {
+        if (g_stop) break;
         wl_display_flush(w.dpy);
-        /* 轮询粒度要远小于帧间隔，否则抓帧节拍会被 poll 超时量化掉 */
-        if (poll(pfd, 2, 1) < 0 && errno != EINTR) break;
+        /* 轮询粒度要远小于帧间隔，否则抓帧节拍会被 poll 超时量化掉；
+           休眠时放宽到 200ms，避免空转唤醒 CPU */
+        if (poll(pfd, 2, w.suspended ? 200 : 1) < 0 && errno != EINTR) break;
+
+        /* compositor 退出/fd 失效时不处理会变成 1ms 忙循环，直接把 CPU 打满 */
+        if (pfd[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "[cap] Wayland 连接异常退出\n");
+            break;
+        }
+        if (pfd[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "[cap] 控制 socket 异常退出\n");
+            break;
+        }
 
         if (pfd[1].revents & POLLIN) {
             char buf[2048];
@@ -817,21 +1419,56 @@ int main(int argc, char **argv)
             if (wl_display_dispatch(w.dpy) == -1) break;
         }
 
+        /* 新输出刚绑定：roundtrip 一次拿到它的初始 geometry/mode/scale，
+           再重算输入布局（否则新插入的显示器不会计入布局） */
+        if (w.layout_dirty) {
+            w.layout_dirty = false;
+            wl_display_roundtrip(w.dpy);
+            update_input_layout(&w);
+        }
+
         uint64_t t = now_us();
 
+        /* 没有会话满 30 秒：停抓帧并释放编码器（GPU 编码会话归零），
+           进程和 Wayland 连接保持常驻，下一个会话接入时立即恢复 */
+        if (!w.suspended && !w.active && w.idle_since_us &&
+            t - w.idle_since_us > 30ull * 1000000ull) {
+            w.suspended = true;
+            if (w.enc) {
+                ww_enc_destroy(w.enc);
+                w.enc = NULL;
+            }
+            w.enc_w = w.enc_h = 0;
+            fprintf(stderr, "[cap] 无会话 30 秒，进入休眠（已停抓帧/编码）\n");
+        }
+        if (w.suspended && w.active) {
+            w.suspended = false;
+            w.need_idr = true;   /* 唤醒后第一帧就是 IDR，客户端不必等下一个 GOP */
+            stat_t = t;
+            stat_frames = w.frames_sent;
+            w.acc_cap_us = w.acc_conv_us = w.acc_enc_us = w.acc_n = 0;
+            fprintf(stderr, "[cap] 会话接入，恢复采集\n");
+        }
+
         /* shm 模式按固定帧率主动抓帧；ext 模式靠 damage + 空闲强制重绘 */
-        if (w.use_shm) {
+        if (w.suspended) {
+            /* 休眠中不发起任何抓帧请求 */
+        } else if (w.use_shm) {
             /* 只在真正发起抓帧时打点，否则 cap 统计会被每轮循环重置 */
             if (!ww_shm_pending(w.shm)) {
                 w.t_tick_us = now_us();
             }
             ww_shm_tick(w.shm);
+#ifdef HAVE_SC_CAPTURE
+        } else if (w.sc) {
+            ww_sc_tick(w.sc);
+#endif
         } else if (w.last_frame_us && t - w.last_frame_us > 800000) {
             system("hyprctl dispatch forcerendererreload >/dev/null 2>&1");
             w.last_frame_us = t;
         }
 
-        if (t - stat_t >= 1000000) {
+        if (!w.suspended && t - stat_t >= 1000000) {
             double n = w.acc_n ? (double)w.acc_n : 1.0;
             double ec = 0, eu = 0, es = 0;
             if (w.enc) {
@@ -839,19 +1476,42 @@ int main(int argc, char **argv)
             }
             fprintf(stderr, "[enc] 转换 %.1fms 上传 %.1fms 提交 %.1fms\n", ec, eu, es);
 
-            /* 清晰优先的自适应：帧率不足就降一档，余量充足再升回去 */
+            double fps_now = (double)(w.frames_sent - stat_frames) * 1e6 / (double)(t - stat_t);
+
+            /* 流畅优先：不动分辨率，只在 QP 24~30 之间按实测帧率浮动 */
+            if (w.strategy == WW_STRAT_SMOOTH && w.enc) {
+                double target = (double)(w.fps > 0 ? w.fps : 60);
+                int nq = w.qp;
+                if (fps_now < target * 0.85) {
+                    nq = w.qp + 2;
+                } else if (fps_now > target * 0.95) {
+                    nq = w.qp - 1;
+                }
+                if (nq < 24) nq = 24;
+                if (nq > 30) nq = 30;
+                if (nq != w.qp) {
+                    w.qp = nq;
+                    ww_enc_set_qp(w.enc, nq);
+                    w.need_idr = true;
+                    fprintf(stderr, "[cap] 流畅优先：QP -> %d（实测 %.0f / 目标 %.0f fps）\n",
+                            nq, fps_now, target);
+                }
+            }
+
+            /* 清晰优先的自适应：按用户选择的目标帧率判断余量，
+               以前写死 26/46，选了 30fps 也会被误判、4K 降档后永远升不回去 */
             if (w.req_w && w.auto_adapt) {
-                double fps_now = (double)(w.frames_sent - stat_frames) * 1e6 / (double)(t - stat_t);
-                if (fps_now < 26.0 && w.cur_preset > 0) {
+                double target = (double)(w.fps > 0 ? w.fps : 60);
+                if (fps_now < target * 0.62 && w.cur_preset > 0) {
                     if (!w.slow_since) {
                         w.slow_since = t;
-                    } else if (t - w.slow_since > 2000000) {
-                        fprintf(stderr, "[cap] 帧率 %.0f 不足，降档\n", fps_now);
+                    } else if (t - w.slow_since > 3000000) {
+                        fprintf(stderr, "[cap] 帧率 %.0f 不足（目标 %.0f），降档\n", fps_now, target);
                         apply_preset(&w, w.cur_preset - 1);
                         w.slow_since = 0;
                     }
                     w.fast_since = 0;
-                } else if (fps_now > 46.0 && w.cur_preset < w.max_preset) {
+                } else if (fps_now > target * 0.92 && w.cur_preset < w.max_preset) {
                     if (!w.fast_since) {
                         w.fast_since = t;
                     } else if (t - w.fast_since > 6000000) {
@@ -865,13 +1525,29 @@ int main(int argc, char **argv)
                     w.fast_since = 0;
                 }
             }
+            double cap_ms = w.shm ? ww_shm_take_cap_ms(w.shm) : 0.0;
+#ifdef HAVE_SC_CAPTURE
+            if (!w.shm && w.sc) {
+                cap_ms = ww_sc_take_cap_ms(w.sc);
+            }
+#endif
             fprintf(stderr, "[cap] %.1f fps, %.2f Mbps, frames=%llu | cap %.1fms conv %.1fms enc %.1fms\n",
                     (double)(w.frames_sent - stat_frames) * 1e6 / (double)(t - stat_t),
                     (double)w.bytes_sent * 8.0 / (double)(t - stat_t),
                     (unsigned long long)w.frames_sent,
-                    w.shm ? ww_shm_take_cap_ms(w.shm) : 0.0,
+                    cap_ms,
                     (double)w.acc_conv_us / n / 1000.0,
                     (double)w.acc_enc_us / n / 1000.0);
+            if (w.aud) {
+                uint64_t ap = 0, ab = 0, ad = 0;
+                ww_audio_stats(w.aud, &ap, &ab, &ad);
+                fprintf(stderr, "[aud] %.1f pkt/s, %.0f kbps, 队列丢弃=%llu\n",
+                        (double)(ap - aud_pkts_prev) * 1e6 / (double)(t - stat_t),
+                        (double)(ab - aud_bytes_prev) * 8.0 * 1e6 / (double)(t - stat_t) / 1000.0,
+                        (unsigned long long)ad);
+                aud_pkts_prev = ap;
+                aud_bytes_prev = ab;
+            }
             w.acc_cap_us = w.acc_conv_us = w.acc_enc_us = w.acc_n = 0;
             stat_t = t;
             stat_frames = w.frames_sent;
@@ -880,7 +1556,18 @@ int main(int argc, char **argv)
     }
 
     ww_enc_destroy(w.enc);
+#ifdef HAVE_SC_CAPTURE
+    ww_sc_destroy(w.sc);
+#endif
+    ww_shm_destroy(w.shm);
     ww_input_destroy(w.input);
+    /* 先停采集线程再关 fd；退出时把目标机扬声器恢复原状态 */
+    if (w.aud) ww_audio_destroy(w.aud);
+    if (w.audio_fd >= 0) close(w.audio_fd);
+    sink_mute_restore();
+    if (w.video_fd >= 0) close(w.video_fd);
+    if (w.ctrl_fd >= 0) close(w.ctrl_fd);
+    unlink(ctrl_path);
     wl_display_disconnect(w.dpy);
     return 0;
 }

@@ -1,5 +1,5 @@
 // WebTransport 封装：datagram 分片重组 + 可靠控制流
-import { VID_HDR_SIZE, WIRE_VERSION, parseFrag, encodeCtrl } from './proto.js';
+import { AUDIO_VERSION, VID_HDR_SIZE, WIRE_VERSION, parseFrag, encodeCtrl } from './proto.js';
 
 export class Transport {
   constructor(url, hooks = {}, options = {}) {
@@ -8,10 +8,22 @@ export class Transport {
     this.hooks = hooks;          // { onChunk(chunk), onClose(), onError(e) }
     this.pending = new Map();     // frameId -> {frags, count, key, pts}
     this.pendingOrder = [];       // 插入顺序，用于 LRU 裁剪
-    this.stats = { datagrams: 0, bytes: 0, lost: 0 };
+    this.stats = {
+      datagrams: 0, bytes: 0, lost: 0,
+      frames: 0,       // 成功重组并交给解码器的帧
+      incomplete: 0,   // 分片缺失/裁剪导致整帧丢弃
+      late: 0,         // 乱序迟到、参考链已过而丢弃的帧
+      audio: { packets: 0, bytes: 0 },   // 音频包只统计到传输层，丢包在 AudioPlayer 里算
+    };
     this.ctrlQueue = [];
     this.closed = false;
     this.connected = false;
+    this.lastFrameId = null;      // 已交给解码器的最大 frameId（datagram 会乱序）
+  }
+
+  /* uint32 帧号回绕安全的“更新”判断 */
+  static #newer(a, b) {
+    return a !== b && ((a - b) >>> 0) < 0x80000000;
   }
 
   async connect() {
@@ -28,6 +40,7 @@ export class Transport {
     if (this.closed) return;
     this.closed = true;
     this.connected = false;
+    this.lastFrameId = null;
     this.pending.clear();
     this.pendingOrder.length = 0;
     try { this.ctrlWriter?.close?.(); } catch { /* noop */ }
@@ -48,6 +61,17 @@ export class Transport {
   }
 
   #onDatagram(buf) {
+    if (buf.byteLength < 1) return;
+
+    /* 音视频共用一个 datagram 通道，靠首字节分流：
+       2 = 音频包（不进视频重组，避免 16B 小包污染 pending Map）。
+       注意 buf 是 Uint8Array，取值只能下标访问（没有 getUint8，那是 DataView 的方法）。 */
+    if (buf[0] === AUDIO_VERSION) {
+      this.stats.audio.packets++;
+      this.stats.audio.bytes += buf.byteLength;
+      this.hooks.onAudio?.(buf);
+      return;
+    }
     if (buf.byteLength < VID_HDR_SIZE) return;
 
     const h = parseFrag(buf);
@@ -65,7 +89,7 @@ export class Transport {
 
     let f = this.pending.get(h.frameId);
     if (!f) {
-      f = { frags: new Array(h.fragCount), have: 0, count: h.fragCount, key: !!(h.flags & 0x01), pts: h.ptsUs };
+      f = { id: h.frameId, frags: new Array(h.fragCount), have: 0, count: h.fragCount, key: !!(h.flags & 0x01), pts: h.ptsUs };
       this.pending.set(h.frameId, f);
       this.pendingOrder.push(h.frameId);
       this.#trimPending();
@@ -86,11 +110,25 @@ export class Transport {
   #trimPending() {
     while (this.pendingOrder.length > 120) {
       const id = this.pendingOrder.shift();
-      if (this.pending.delete(id)) this.stats.lost++;
+      if (this.pending.delete(id)) { this.stats.lost++; this.stats.incomplete++; }
     }
   }
 
   #emit(f) {
+    /* QUIC datagram 不保证顺序：后一帧可能先凑齐。迟到帧如果还送给解码器，
+       会让 H.264 参考链倒退（花屏），所以只按 frameId 单调递增交付。
+       若倒退太多（>300 帧），视为 wwcap 重启、帧号归零，重新接受。 */
+    if (this.lastFrameId !== null) {
+      if (!Transport.#newer(f.id, this.lastFrameId)) {
+        if (((this.lastFrameId - f.id) >>> 0) <= 300) {
+          this.stats.lost++;
+          this.stats.late++;
+          return;
+        }
+      }
+    }
+    this.lastFrameId = f.id;
+    this.stats.frames++;
     let len = 0;
     for (const p of f.frags) len += p.length;
     const data = new Uint8Array(len);
@@ -109,6 +147,7 @@ export class Transport {
       for (const m of this.ctrlQueue) this.send(m);
       this.ctrlQueue.length = 0;
     } catch (e) {
+      console.error('ww: 控制流建立失败', e?.name, e?.message ?? e);
       this.hooks.onError?.(e);
     }
   }
@@ -137,6 +176,7 @@ export class Transport {
   }
 
   send(obj) {
+    if (this.closed) return;    // 断线后 input 仍可能触发，直接丢弃
     if (!this.ctrlWriter) {
       if (this.ctrlQueue.length < 64) this.ctrlQueue.push(obj);
       return;

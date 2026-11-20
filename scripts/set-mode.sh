@@ -20,6 +20,7 @@ WL="$(ls "$XDG_RUNTIME_DIR" | grep -E '^wayland-[0-9]+$' | head -1)"
 setsid env WAYLAND_DISPLAY="$WL" "$ROOT/capture/build/wwcap" \
     --video "$XDG_RUNTIME_DIR/ww-video.sock" \
     --ctrl "$XDG_RUNTIME_DIR/wwcap-ctrl.sock" \
+    --audio "$XDG_RUNTIME_DIR/ww-audio.sock" \
     > /tmp/wwcap.log 2>&1 &
 
 sleep 3

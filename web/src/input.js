@@ -19,112 +19,171 @@ const KEYMAP = {
 const BTN = { 0: 272, 1: 274, 2: 273 }; // left / middle / right (Linux BTN_*)
 
 export class Input {
-  constructor(canvas, cursorEl, send, { onToggleHud }) {
+  /* 不要在这里画自绘光标：wwcap 的 screencopy 已经把 compositor 光标
+     一起编进视频帧（Hyprland 会忽略 overlay_cursor=0），本地再画一支
+     就是屏幕上同时出现两个鼠标。这里只负责把事件转成注入消息。 */
+  constructor(canvas, send, { onToggleStats }) {
     this.canvas = canvas;
-    this.cursor = cursorEl;
     this.send = send;
-    this.onToggleHud = onToggleHud;
+    this.onToggleStats = onToggleStats;
     this.locked = false;
-    this.mode = 'abs';
-    this.accX = 0;
-    this.accY = 0;
     this.rafPending = false;
-    this.vx = 0.5;   // 指针锁定时的虚拟光标位置（归一化）
-    this.vy = 0.5;
+    this.rect = null;
+    // 绝对模式：每帧只发最新位置，避免高频 pointermove 把可靠控制流刷爆
+    this.absX = null;
+    this.absY = null;
+    // 相对模式（?lock=1）累积位移
+    this.relX = 0;
+    this.relY = 0;
+    this.wheel = 0;
+    // 已按下的键/按钮，失焦或断线时补发释放，避免远端卡住
+    this.keysDown = new Set();
+    this.btnsDown = new Set();
     this.#bind();
+  }
+
+  #rect() {
+    if (!this.rect) this.rect = this.canvas.getBoundingClientRect();
+    return this.rect;
+  }
+
+  /* 记录归一化坐标；画布外（信箱黑边、HUD、设置面板）返回 false，
+     不移动远端指针：以前会 clamp 到 0/1，指针被钉在边缘像在乱飘 */
+  #setAbs(e) {
+    const r = this.#rect();
+    if (!r.width || !r.height) return false;
+    const x = (e.clientX - r.left) / r.width;
+    const y = (e.clientY - r.top) / r.height;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return false;
+    this.absX = x;
+    this.absY = y;
+    return true;
+  }
+
+  #flush() {
+    this.rafPending = false;
+    if (this.absX !== null && !this.locked) {
+      this.send({ t: 'pm', x: this.absX, y: this.absY });
+      this.absX = null;
+      this.absY = null;
+    }
+    if (this.locked && (this.relX || this.relY)) {
+      this.send({ t: 'pr', dx: this.relX, dy: this.relY });
+      this.relX = 0;
+      this.relY = 0;
+    }
+    if (this.wheel) {
+      this.send({ t: 'pw', v: this.wheel });
+      this.wheel = 0;
+    }
+  }
+
+  #schedule() {
+    if (this.rafPending) return;
+    this.rafPending = true;
+    requestAnimationFrame(() => this.#flush());
+  }
+
+  /* 释放所有按下的键鼠：切标签页/刷新/断线后远端不会残留 Shift/Super/Ctrl */
+  releaseAll() {
+    for (const k of this.keysDown) this.send({ t: 'kk', k, d: 0 });
+    for (const b of this.btnsDown) this.send({ t: 'pb', b, d: 0 });
+    this.keysDown.clear();
+    this.btnsDown.clear();
+  }
+
+  destroy() {
+    this.releaseAll();
+    const h = this.h || {};
+    for (const [el, type, fn] of h.list || []) el.removeEventListener(type, fn);
+    this.h = null;
   }
 
   #bind() {
     const c = this.canvas;
+    this.h = { list: [] };
+    const on = (el, type, fn, opts) => {
+      el.addEventListener(type, fn, opts);
+      this.h.list.push([el, type, fn]);
+    };
 
-    c.addEventListener('click', () => {
-      if (document.pointerLockElement !== c) c.requestPointerLock?.();
-    });
-
-    document.addEventListener('pointerlockchange', () => {
+    /* 注意：进入串流时**不要**自动请求 Pointer Lock。
+       锁定后浏览器只给 movementX/Y，必须靠服务端相对位移换算，极易漂移；
+       默认保持绝对定位（点击位置与画面严格对应）。需要相对模式时用 ?lock=1。 */
+    on(document, 'pointerlockchange', () => {
       this.locked = document.pointerLockElement === c;
-      // 锁定后系统指针被隐藏，改为用自绘光标跟踪「虚拟位置」，保证始终可见
-      this.cursor.classList.remove('hidden');
       if (this.locked) {
-        // 锁定瞬间先做一次绝对定位对齐，否则本地基准与远端光标不一致，指针会整体偏移
-        this.send({ t: 'pm', x: this.vx, y: this.vy });
-        this.accX = 0;
-        this.accY = 0;
+        // 进入相对模式前用当前绝对位置对齐一次，避免远端光标跳变
+        if (this.absX !== null) this.send({ t: 'pm', x: this.absX, y: this.absY });
+        this.relX = 0;
+        this.relY = 0;
       }
     });
 
-    window.addEventListener('keydown', (e) => {
+    on(window, 'keydown', (e) => {
       if (e.ctrlKey && e.altKey && e.code === 'F1') {
         e.preventDefault();
-        this.onToggleHud?.();
+        this.onToggleStats?.();
         return;
       }
       const k = KEYMAP[e.code];
       if (k === undefined) return;
       e.preventDefault();
+      if (e.repeat) return;          // 远端自行处理长按重复
+      this.keysDown.add(k);
       this.send({ t: 'kk', k, d: 1 });
     });
 
-    window.addEventListener('keyup', (e) => {
+    on(window, 'keyup', (e) => {
       const k = KEYMAP[e.code];
       if (k === undefined) return;
       e.preventDefault();
+      this.keysDown.delete(k);
       this.send({ t: 'kk', k, d: 0 });
     });
 
-    window.addEventListener('mousemove', (e) => {
+    on(window, 'mousemove', (e) => {
       if (this.locked) {
-        // 指针锁定：按帧合并相对位移，避免高 DPI 鼠标刷爆控制流
-        this.accX += e.movementX;
-        this.accY += e.movementY;
-
-        // 锁定期间 clientX 固定，用累积位移推进自绘光标的虚拟位置
-        this.vx = Math.min(1, Math.max(0, this.vx + e.movementX / window.innerWidth));
-        this.vy = Math.min(1, Math.max(0, this.vy + e.movementY / window.innerHeight));
-        this.cursor.style.transform =
-          `translate3d(${this.vx * window.innerWidth}px, ${this.vy * window.innerHeight}px, 0)`;
-        this.cursor.classList.remove('hidden');
-
-        if (!this.rafPending) {
-          this.rafPending = true;
-          requestAnimationFrame(() => {
-            this.rafPending = false;
-            if (this.accX || this.accY) {
-              this.send({ t: 'pr', dx: this.accX, dy: this.accY });
-              this.accX = 0;
-              this.accY = 0;
-            }
-          });
-        }
-      } else {
-        this.vx = e.clientX / window.innerWidth;
-        this.vy = e.clientY / window.innerHeight;
-        const r = c.getBoundingClientRect();
-        const x = (e.clientX - r.left) / r.width;
-        const y = (e.clientY - r.top) / r.height;
-        this.cursor.style.transform =
-          `translate3d(${e.clientX}px, ${e.clientY}px, 0)`;
-        this.cursor.classList.remove('hidden');
-        this.send({ t: 'pm', x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) });
+        this.relX += e.movementX;
+        this.relY += e.movementY;
+        this.#schedule();
+        return;
       }
+      if (this.#setAbs(e)) this.#schedule();
     });
 
-    c.addEventListener('mousedown', (e) => {
+    on(c, 'mousedown', (e) => {
       const b = BTN[e.button];
-      if (b) this.send({ t: 'pb', b, d: 1 });
+      if (!b) return;
+      /* mousemove 是 rAF 合并发送的：同一帧内“移动后立刻点击”时，
+         pb 会先于 pm 到达，点击就落在旧位置。按下前先把坐标刷出去。 */
+      this.#setAbs(e);
+      this.#flush();
+      this.btnsDown.add(b);
+      this.send({ t: 'pb', b, d: 1 });
     });
 
-    c.addEventListener('mouseup', (e) => {
+    /* 松开可能发生在画布外/窗口外，绑 window 才不会永久按住左键 */
+    on(window, 'mouseup', (e) => {
       const b = BTN[e.button];
-      if (b) this.send({ t: 'pb', b, d: 0 });
+      if (!b) return;
+      this.btnsDown.delete(b);
+      this.send({ t: 'pb', b, d: 0 });
     });
 
-    c.addEventListener('contextmenu', (e) => e.preventDefault());
+    on(c, 'contextmenu', (e) => e.preventDefault());
 
-    c.addEventListener('wheel', (e) => {
+    on(c, 'wheel', (e) => {
       e.preventDefault();
-      const v = (e.deltaY > 0 ? 1 : -1) * 15;
-      this.send({ t: 'pw', v });
+      this.wheel += (e.deltaY > 0 ? 1 : -1) * 15;
+      this.#schedule();
     }, { passive: false });
+
+    on(window, 'resize', () => { this.rect = null; });
+    on(window, 'blur', () => this.releaseAll());
+    on(document, 'visibilitychange', () => {
+      if (document.visibilityState === 'hidden') this.releaseAll();
+    });
+    on(window, 'pagehide', () => this.releaseAll());
   }
 }

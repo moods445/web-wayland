@@ -10,7 +10,11 @@ Environment=LIBSEAT_BACKEND=seatd
 Environment=AQ_DRM_DEVICES=/dev/dri/card1
 Environment=HYPRLAND_NO_SD_NOTIFY=1
 Environment=HYPRLAND_NO_CRASHREPORTER=1
-ExecStart=/usr/bin/start-hyprland
+# 清掉调用方可能带进来的私有库路径（旧 libstdc++ 会让 start-hyprland 报 GLIBCXX 缺失）
+Environment=LD_LIBRARY_PATH=
+# 一定要显式指定配置：Hyprland 0.5x 默认优先加载 hyprland.lua，
+# 不指定就会用 /usr/share/hypr/hyprland.lua 的示例配置，项目里的绑定/显示器规则全部失效
+ExecStart=/usr/bin/start-hyprland -- --config %h/.config/hypr/hyprland.conf
 Restart=on-failure
 RestartSec=3
 

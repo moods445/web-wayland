@@ -14,6 +14,10 @@ avcodec_dep = dependency('libavcodec')
 avutil_dep  = dependency('libavutil')
 swscale_dep = dependency('libswscale')
 threads_dep = dependency('threads')
+# 音频：PipeWire 抓默认 sink 的 monitor，Opus 编码（48kHz 立体声 20ms 帧）。
+# 硬依赖：缺 libpipewire-0.3-dev / libopus-dev 时直接构建失败，见 README 依赖行。
+pipewire_dep = dependency('libpipewire-0.3')
+opus_dep     = dependency('opus')
 
 gen_src = files(
   'src/generated/ext-image-copy-capture-v1.c',
@@ -28,10 +32,25 @@ gen_src = files(
 
 inc = include_directories('src', '../proto')
 
+# ── 可选的零拷贝抓帧后端（独显）：screencopy dmabuf → EGL/GL shader → NV12 ──
+egl_dep = dependency('egl', required: false)
+gl_dep = dependency('gl', required: false)
+
+have_glcapture = egl_dep.found() and gl_dep.found()
+
+extra_src = []
+extra_deps = []
+extra_args = []
+if have_glcapture
+  extra_src += ['src/capture_sc.c']
+  extra_deps += [egl_dep, gl_dep]
+  extra_args += ['-DHAVE_SC_CAPTURE']
+endif
+
 executable('wwcap',
-  ['src/main.c', 'src/encoder_vaapi.c', 'src/input.c', 'src/capture_shm.c', 'src/yuv_shim.cc'] + gen_src,
-  dependencies: [wl_dep, gbm_dep, drm_dep, va_dep, xkb_dep, avcodec_dep, avutil_dep, swscale_dep, threads_dep, yuv_dep],
+  ['src/main.c', 'src/encoder_vaapi.c', 'src/input.c', 'src/capture_shm.c', 'src/audio.c', 'src/yuv_shim.cc'] + extra_src + gen_src,
+  dependencies: [wl_dep, gbm_dep, drm_dep, va_dep, xkb_dep, avcodec_dep, avutil_dep, swscale_dep, threads_dep, yuv_dep, pipewire_dep, opus_dep] + extra_deps,
   include_directories: inc,
-  c_args: yuv_dep.found() ? ['-DHAVE_LIBYUV'] : [],
+  c_args: (yuv_dep.found() ? ['-DHAVE_LIBYUV'] : []) + extra_args,
   install: false,
 )

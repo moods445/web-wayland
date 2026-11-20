@@ -21,7 +21,8 @@ web     JS · WebCodecs 解码 + canvas 上屏 + 键鼠捕获（无构建步骤�
 # 1) 依赖（Debian 13，backports 已启用）
 sudo apt install -y hyprland hyprland-protocols seatd waybar fuzzel hyprpaper \
     libwlroots-0.18-dev libdrm-dev libgbm-dev libavcodec-dev libavutil-dev \
-    libswscale-dev libva-dev xkbcommon libnss3-dev meson ninja-build grim
+    libswscale-dev libva-dev xkbcommon libnss3-dev meson ninja-build grim \
+    libpipewire-0.3-dev libopus-dev
 
 # 2) 构建
 ./scripts/gen-protocols.sh                 # 生成 Wayland 协议绑定
@@ -44,7 +45,22 @@ meson setup capture/build && ninja -C capture/build
 | `?auto=1` | 直接进入并请求全屏（可做成桌面快捷方式） |
 | `?debug=1` | 显示左下角底层的分片/帧计数 |
 
-`Ctrl+Alt+F1` 切换性能叠层。首次访问需要在 Mac 上信任一次 `certs/ca.crt`（HTTPS 页面用），WebTransport 通道用哈希钉扎，不需要额外信任。
+`Ctrl+Alt+F1` 切换统计信息面板（默认关闭，也可在设置里勾选）。设置里的「快捷键帮助」列出键盘/鼠标操作，并逐条说明统计字段的含义。首次访问需要在 Mac 上信任一次 `certs/ca.crt`（HTTPS 页面用），WebTransport 通道用哈希钉扎，不需要额外信任。
+
+## 开机自启与空闲休眠
+
+服务用 **systemd 用户单元**常驻，开机即起、无需登录桌面：
+
+```bash
+./scripts/install-services.sh          # 安装单元 + enable + linger
+systemctl --user status ww-session ww-gateway ww-cap
+journalctl --user -u ww-cap -f         # 抓帧 / 休眠日志
+```
+
+- 单元链：`ww-session`（Hyprland）→ `ww-gateway`（:8443）→ `ww-cap`（抓帧编码）。`loginctl enable-linger` 保证无人登录也会拉起。
+- **空闲休眠**：网关在最后一个客户端断开时通知 wwcap；30 秒无会话就停止抓帧、销毁编码器（CPU 接近 0、释放 VAAPI 会话），进程和桌面常驻。浏览器一连上立即唤醒并强制 IDR，约 1 秒出图。
+- `ww-session` 显式带 `--config ~/.config/hypr/hyprland.conf`：新版 Hyprland 默认优先加载 `hyprland.lua`，不指定会退回 `/usr/share/hypr` 的示例配置，绑定/显示器规则全部失效。
+- 回到手动调试：`systemctl --user stop ww-session ww-gateway ww-cap`，再 `./scripts/run-all.sh`。
 
 ## 分辨率协商（默认 1080p，4K 用 2x UI）
 
@@ -56,6 +72,64 @@ meson setup capture/build && ninja -C capture/build
 - 窗口尺寸变化有 300ms 防抖，再触发一次协商。
 
 手动切换：`./scripts/set-mode.sh 1920x1080@60`（或用 `hyprctl keyword monitor` 直接改，wwcap 会自愈重建编码器）。
+
+## 音频（下行已支持，上行麦克风在二期）
+
+```
+PipeWire 虚拟 sink ww-desk 的 monitor（只含应用声音，不含麦克风）
+      │ 48kHz 立体声 · 20ms/帧 · Opus 64kbps · 每包带上一帧做 RED 冗余
+      ▼
+wwcap ──Unix DGRAM──▶ wwgw ──WebTransport datagram──▶ 浏览器 AudioDecoder
+                                                        └─▶ AudioWorklet 环形缓冲 ─▶ 扬声器
+```
+
+- **采集目标是虚拟 sink `ww-desk`，不是硬件 sink**：本机声卡（ALC3246）默认开启 Loopback Mixing，
+  硬件 sink 的 monitor 会混入麦克风/环境声，客户端听到的其实是服务器周围的声音，扬声器与内置麦
+  还会形成声学回环、持续蜂鸣。`scripts/pipewire/50-ww-desk.conf` 创建 null sink 并设为默认输出，
+  应用声音只进虚拟设备；wwcap 用 `target.object=ww-desk` 只抓它的 monitor。
+  首次运行 `scripts/run-all.sh` 会自动安装配置并设为默认（需要重启一次 PipeWire）。
+  验证：`pw-link -l | grep wwcap-audio` 应只看到 `ww-desk:monitor_FL/FR`。
+
+- **音视频共用一个 datagram 通道**，靠首字节分流：`1` = 视频分片（24B 头），`2` = 音频包（16B 头）。
+  音频包不参与视频重组，`web/src/transport.js` 的 `#onDatagram` 第一行就分流。
+- **时间轴不跨机对钟**：20ms 一包使 `seq` 本身就是稳定时钟；视频帧的 `pts_us` 通过音频包到达时刻做偏移估计后再映射。
+- **单包丢失可完整恢复**：每包携带 `seq-1` 的完整 Opus 帧（RED），`ahead===1` 时直接补播；
+  更大缺口由 worklet 淡出遮挡（WebCodecs 不暴露 `decode_fec`，多包丢失只能遮挡）。
+- **缓冲自适应**：初始 40ms，水位低于 10ms 才上调（上限 120ms），长期过高回落到 40ms。
+
+测试整条链路：
+
+```bash
+# 服务端放一段 1kHz（浏览器里应立刻听到）
+bash scripts/audio-test-tone.sh 5
+# 只验服务端是否在发：应看到 pkt/s ≈ 50、kbps ≈ 64~130（开冗余时）
+grep '\[aud\]' /tmp/wwcap.log
+```
+
+设置面板里的三项语义：**我的音量**只改本机 `GainNode`；**静音目标机扬声器**经 ctrl 下发
+`wpctl set-mute`，并在最后一个客户端断开/进程退出时恢复原状态；**失去焦点时静音**纯本地。
+
+## 画面卡住 / 黑屏的自救
+
+浏览器「串流设置 → 串流控制」里有两个按钮，不需要登录服务器：
+
+| 按钮 | 实际动作 | 代价 |
+|---|---|---|
+| **重启采集** | 网关跑 `scripts/restart-capture.sh`：按原参数重启 `wwcap`，先 `hyprctl dispatch forcerendererreload` 把卡住的 screencopy 队列推一下 | 画面中断 1–3s，桌面里的窗口都保留 |
+| **强制恢复桌面** | 同上再加 `--deep`：连 Hyprland 会话一起重建（走 `run-all.sh`） | 桌面里的程序会被关闭，需刷新页面重连（约 10–15s） |
+
+判定「恢复成功」不靠服务端日志：客户端先确认 `/healthz` 的 `restarts` 计数 +1（这代表网关真的接了单），
+再确认帧计数继续增长，两者都满足才显示「已恢复」。5 秒内重复点击会被网关回 `busy`。
+
+手工等价操作：
+
+```bash
+bash scripts/restart-capture.sh          # 等价于「重启采集」
+bash scripts/restart-capture.sh --deep   # 等价于「强制恢复桌面」
+```
+
+> 根因提醒：Hyprland 的 `wlr-screencopy` 一旦卡住，`wwcap` 进程还活着但一直 `0 fps`，
+> 而且**只杀进程不够**（拷贝请求留在合成器里），所以脚本必须先 `forcerendererreload`。
 
 ## 实测性能
 
@@ -87,6 +161,10 @@ meson setup capture/build && ninja -C capture/build
 7. **抓帧必须主动按帧率发起**，且主循环 `poll` 超时不能大于帧间隔（现为 4ms）。曾因 500ms 超时把 1080p 节流到 2fps。
 7. **协议头必须 24 字节**（`version,flags,stream_id,frame_id,frag_index,frag_count,payload_len` + `pts_us@16`）。曾经多一个 `_reserved` 导致 `pts_us` 错位、WebCodecs 抛 timestamp 越界。
 8. **前端解码**：`avc: {format:'annexb'}`，codec 串从 SPS 推导（constraint 写 `00`，level 上限 5.1）；必须等到关键帧再解；解码器报错会被 Chrome 关闭，需重建并请求 IDR；时间戳必须严格递增。
+9. **音频与视频共用 datagram 通道，靠首字节判别媒体类型**（视频头 `version=1`，音频包 `version=2`）。
+   音频包头固定 16 字节，改字段必须同步 `web/src/proto.js` 的 `parseAudio`，否则音频会静默无声。
+   另：Opus 编码/发送在 PipeWire RT 回调里完成，**不要**在该路径上加锁或做重活。
+10. **统计面板的 Host processing latency 无法实现**：24 字节协议头里只有 `pts_us`（主机时钟），没有采集/编码时间戳，跨机时钟不可比，因此该项固定显示 `- / - / - ms`。网络延迟由控制流 `ping/pong` 测量（网关直接回环，不经过 wwcap），与 QUIC 内部 RTT 可能略有差异。
 
 ## 已修复的坑（本轮）
 
@@ -96,6 +174,7 @@ meson setup capture/build && ninja -C capture/build
 | 首帧后无新帧 | screencopy 协议漏了 `buffer_done` 事件，`copy` 发不出 | 补事件并在回调里发起 copy |
 | 鼠标乱飘/顶到右边缘 | 虚拟指针协议时间是**单个 uint32**，我们按 hi/lo 两个参数发 → 参数整体错位 | 改协议定义 + 调用 |
 | 鼠标线性度不对 | Hyprland 指针加速放大相对位移 | `accel_profile=flat` + `force_no_accel` |
+| 鼠标完全不动（新会话连上后） | 输入权被没断干净的旧会话（异常退出的标签页/自动化测试）永久占住，新会话的 `pm` 被网关静默丢弃 | 输入权改为 1.5s 租约：owner 空闲超时后其他会话可接管 |
 | 键盘完全无效 | keymap fd 偏移未归零，compositor 读到空 keymap | `lseek(fd,0,SEEK_SET)` |
 | 组合键不生效 | 没发 `modifiers` 请求 | 维护修饰键位掩码并上报 |
 | 按键错位（SUPER+2→工作区10） | Hyprland 内部会 +8，不能再手动加 | 直接发 evdev 原始码 |
@@ -124,4 +203,7 @@ node scripts/cdp-shot.mjs 9222 /tmp/live.png 8000
 - 光标形状未取真实位图：视频里不含光标，前端画固定箭头；`ext_image_copy_capture_cursor_session` 的位图/热点尚未接入（要"看到真实光标形状"需补这一步）。
 - 自适应控制器只做了 QP 单旋钮；AIMD 与丢包反馈的闭环尚未接上（`stats` 消息已上报，服务端未消费）。
 - 4K 物理极限 ~17–23fps（无 VPP，CPU 转换）；1080p 55–58fps。
-- 音频、剪贴板、文件传输不在本期范围。
+- 音频只做**下行**（整机混音）；浏览器麦克风上行（服务端 `ww-mic` 虚拟麦克风）与 waybar
+  「远程麦克风使用中」指示属于二期，协议里已预留 `WW_IPC_AUDIO_UP` 与尾帧 `reserved` 字段。
+- 音频不做码率自适应：固定 64kbps，仅按客户端上报的丢包率开关 RED 冗余（>2% 开，<0.2% 关）。
+- 剪贴板、文件传输不在本期范围。

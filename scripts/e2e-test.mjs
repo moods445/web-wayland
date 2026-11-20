@@ -1,5 +1,12 @@
 // 端到端自动化测试：启动无头 Chrome → 通过 window.__ww 断言串流健康度
 // 用法: node scripts/e2e-test.mjs [cdpPort] [waitMs]
+// 用例说明（分类 / 前置 / 步骤 / 预期）：../docs/TEST-CASES.md
+//   B 连接与传输   ../docs/TEST-CASES.md#b-连接与传输
+//   C 画面渲染与清晰度 ../docs/TEST-CASES.md#c-画面渲染与清晰度
+//   D 分辨率协商   ../docs/TEST-CASES.md#d-分辨率协商
+//   E 输入链路     ../docs/TEST-CASES.md#e-输入链路
+//   L 串流策略     ../docs/TEST-CASES.md#l-串流策略
+//   M 色度采样 4:4:4 ../docs/TEST-CASES.md#m-色度采样-444
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 

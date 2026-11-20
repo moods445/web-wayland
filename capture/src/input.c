@@ -32,7 +32,13 @@ struct ww_input {
        与本项目手写协议头不一致（实测 y 收到的是 x 值），故自行跟踪位置 */
     int width, height;
     double cur_x, cur_y;
+    /* 抓帧输出在 compositor 布局里的位置/逻辑尺寸，以及整个布局的逻辑尺寸 */
+    int out_x, out_y, out_w, out_h;
+    int layout_w, layout_h;
     uint32_t mods;      /* XKB 修饰键位掩码：1=shift 4=ctrl 8=alt 64=super */
+    uint32_t locked;    /* XKB locked 位：2=CapsLock */
+    uint8_t pressed[256];  /* 已按下的键，断线时补发释放 */
+    uint8_t buttons[8];    /* 已按下的鼠标键（BTN_LEFT=272 起） */
 };
 
 static void send_keymap(struct ww_input *in)
@@ -86,6 +92,10 @@ struct ww_input *ww_input_create(struct wl_display *dpy, struct wl_seat *seat)
         return NULL;
     }
     in->dpy = dpy;
+    /* 默认给 1x1：绝对定位本身用归一化坐标，宽高只用于有效性判断。
+       以前初始为 0，导致首帧编码成功之前所有鼠标事件被静默丢弃。 */
+    in->width = 1;
+    in->height = 1;
 
     struct wl_registry *reg = wl_display_get_registry(dpy);
     (void)reg;
@@ -135,12 +145,23 @@ void ww_input_key(struct ww_input *in, uint32_t keycode, bool down)
     case 29: case 97: bit = 4; break;      /* CTRL_L/R   */
     case 56: case 100: bit = 8; break;     /* ALT_L/R    */
     case 125: case 126: bit = 64; break;   /* META_L/R   */
-    case 58: bit = 2; break;               /* CAPSLOCK   */
     default: break;
     }
+    bool mods_changed = false;
     if (bit) {
         if (down) in->mods |= bit; else in->mods &= ~bit;
-        zwp_virtual_keyboard_v1_modifiers(in->kb, in->mods, 0, 0, 0);
+        mods_changed = true;
+    }
+    /* CapsLock 是锁定键：按下翻转 locked 位，松开不再清掉 */
+    if (keycode == 58) {
+        if (down) in->locked ^= 2;
+        mods_changed = true;
+    }
+    if (mods_changed) {
+        zwp_virtual_keyboard_v1_modifiers(in->kb, in->mods, 0, in->locked, 0);
+    }
+    if (keycode < 256) {
+        in->pressed[keycode] = down ? 1 : 0;
     }
 
     /* Hyprland 内部会把收到的码 +8 转成 xkb keycode，因此这里直接发 evdev 原始码 */
@@ -157,6 +178,20 @@ void ww_input_set_geometry(struct ww_input *in, int w, int h)
     in->height = h > 0 ? h : 1;
     in->cur_x = 0.5;
     in->cur_y = 0.5;
+}
+
+void ww_input_set_layout(struct ww_input *in, int ox, int oy, int ow, int oh,
+                         int layout_w, int layout_h)
+{
+    if (!in) {
+        return;
+    }
+    in->out_x = ox;
+    in->out_y = oy;
+    in->out_w = ow > 0 ? ow : 0;
+    in->out_h = oh > 0 ? oh : 0;
+    in->layout_w = layout_w > 0 ? layout_w : 0;
+    in->layout_h = layout_h > 0 ? layout_h : 0;
 }
 
 void ww_input_set_position(struct ww_input *in, int px, int py)
@@ -178,10 +213,24 @@ void ww_input_motion_abs(struct ww_input *in, double nx, double ny)
     if (ny < 0) ny = 0;
     if (ny > 1) ny = 1;
 
-    /* 用协议原生的绝对定位：不累积误差，点击位置与画面严格对应 */
+    /* 用协议原生的绝对定位：不累积误差，点击位置与画面严格对应。
+       但 motion_absolute 的 (x,y,extent) 是**整个布局**的归一化坐标：
+       直接发 nx/ny 会把指针按布局宽度摊开（两块屏时视频里光标跑到另一块屏，
+       点击位置也跟着错位）。先换算到抓帧输出在布局中的物理位置。 */
+    double lw = in->layout_w > 0 ? (double)in->layout_w : (double)in->width;
+    double lh = in->layout_h > 0 ? (double)in->layout_h : (double)in->height;
+    double ow = in->out_w > 0 ? (double)in->out_w : (double)in->width;
+    double oh = in->out_h > 0 ? (double)in->out_h : (double)in->height;
+    double ax = ((double)in->out_x + nx * ow) / lw;
+    double ay = ((double)in->out_y + ny * oh) / lh;
+    if (ax < 0) ax = 0;
+    if (ax > 1) ax = 1;
+    if (ay < 0) ay = 0;
+    if (ay > 1) ay = 1;
+
     in->time_ms = now_ms();
-    uint32_t x = (uint32_t)(nx * 65535.0 + 0.5);
-    uint32_t y = (uint32_t)(ny * 65535.0 + 0.5);
+    uint32_t x = (uint32_t)(ax * 65535.0 + 0.5);
+    uint32_t y = (uint32_t)(ay * 65535.0 + 0.5);
     zwlr_virtual_pointer_v1_motion_absolute(in->ptr, in->time_ms, x, y, 65535, 65535);
     zwlr_virtual_pointer_v1_frame(in->ptr);
     wl_display_flush(in->dpy);
@@ -204,9 +253,43 @@ void ww_input_button(struct ww_input *in, uint32_t button, bool down)
     if (!in || !in->ptr) {
         return;
     }
+    if (button >= 272 && button < 280) {
+        in->buttons[button - 272] = down ? 1 : 0;
+    }
     in->time_ms = now_ms();
     zwlr_virtual_pointer_v1_button(in->ptr, in->time_ms, button, down ? 1 : 0);
     zwlr_virtual_pointer_v1_frame(in->ptr);
+    wl_display_flush(in->dpy);
+}
+
+/* 客户端断开/页面刷新时调用：补发所有释放，避免 SUPER/CTRL 卡死在桌面 */
+void ww_input_reset(struct ww_input *in)
+{
+    if (!in) {
+        return;
+    }
+    in->time_ms = now_ms();
+    if (in->kb) {
+        for (int i = 1; i < 256; i++) {
+            if (in->pressed[i]) {
+                zwp_virtual_keyboard_v1_key(in->kb, in->time_ms, (uint32_t)i, 0);
+                in->pressed[i] = 0;
+            }
+        }
+        in->mods = 0;
+        in->locked = 0;
+        zwp_virtual_keyboard_v1_modifiers(in->kb, 0, 0, 0, 0);
+    }
+    if (in->ptr) {
+        for (int b = 0; b < 8; b++) {
+            if (in->buttons[b]) {
+                zwlr_virtual_pointer_v1_button(in->ptr, in->time_ms,
+                                               (uint32_t)(272 + b), 0);
+                in->buttons[b] = 0;
+            }
+        }
+        zwlr_virtual_pointer_v1_frame(in->ptr);
+    }
     wl_display_flush(in->dpy);
 }
 
