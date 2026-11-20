@@ -23,10 +23,10 @@ export class Input {
      光标由 main.js 的 #cursor-local 绘制，前提是服务端已用透明光标主题把
      compositor 光标从画面里去掉（/capabilities 的 cursor:"local"）。
      两边只允许有一支光标，否则会同时出现两个鼠标。 */
-  constructor(canvas, send, { onToggleStats, onPointer } = {}) {
+  constructor(canvas, send, { onToggleHud, onPointer } = {}) {
     this.canvas = canvas;
     this.send = send;
-    this.onToggleStats = onToggleStats;
+    this.onToggleHud = onToggleHud;
     /* onPointer(clientX, clientY, nx, ny)：本地光标用，必须每帧同步、不走 rAF 节流 */
     this.onPointer = onPointer;
     this.locked = false;
@@ -48,6 +48,13 @@ export class Input {
   #rect() {
     if (!this.rect) this.rect = this.canvas.getBoundingClientRect();
     return this.rect;
+  }
+
+  /* 画布 CSS 尺寸变化（首帧适配、全屏、DPR 变化）后必须重算，
+     否则会拿旧的 300×150 默认尺寸做命中判断，指针几乎永远算“画布外”，
+     本地光标便一直不显示。 */
+  invalidateRect() {
+    this.rect = null;
   }
 
   /* 记录归一化坐标；画布外（信箱黑边、HUD、设置面板）返回 false，
@@ -127,7 +134,7 @@ export class Input {
     on(window, 'keydown', (e) => {
       if (e.ctrlKey && e.altKey && e.code === 'F1') {
         e.preventDefault();
-        this.onToggleStats?.();
+        this.onToggleHud?.();
         return;
       }
       const k = KEYMAP[e.code];

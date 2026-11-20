@@ -157,6 +157,13 @@ function setStatsVisible(on) {
   }
 }
 
+function setHudVisible(on) {
+  pref.hud = !!on;
+  ui.setHud.checked = pref.hud;
+  ui.hud.classList.toggle('hidden', !pref.hud);
+  savePref();
+}
+
 function setHelpVisible(on) {
   ui.help.classList.toggle('hidden', !on);
 }
@@ -603,6 +610,8 @@ function fitCanvas() {
     : fill;
   ui.canvas.style.width = `${Math.round(lastFrameW * s)}px`;
   ui.canvas.style.height = `${Math.round(lastFrameH * s)}px`;
+  /* 画布尺寸变了，输入层缓存的命中矩形要作废，否则本地光标会按旧尺寸判定 */
+  input?.invalidateRect();
 }
 window.addEventListener('resize', fitCanvas);
 // DPR 变化（拖到另一块屏/系统缩放改动）也要重新适配
@@ -995,7 +1004,8 @@ async function enter(fullscreen) {
 
     /* 每条出站输入先过 trace：补客户端时间戳 + 记账（不发则丢弃） */
     input = new Input(ui.canvas, (m) => { if (transport && !transport.closed) transport.send(trace.input(m)); }, {
-      onToggleStats: () => setStatsVisible(!pref.stats),
+      /* Ctrl+Alt+F1 切换串流状态叠层（HUD），与叠层上的提示保持一致 */
+      onToggleHud: () => setHudVisible(!pref.hud),
       /* 本地光标跟随真实指针，每帧同步更新（不经 rAF 节流） */
       onPointer: (cx, cy) => placeLocalCursor(cx, cy),
     });
@@ -1190,11 +1200,7 @@ ui.setFps.addEventListener('change', () => {
   savePref();
   requestFps(pref.fps);
 });
-ui.setHud.addEventListener('change', () => {
-  pref.hud = ui.setHud.checked;
-  savePref();
-  ui.hud.classList.toggle('hidden', !pref.hud);
-});
+ui.setHud.addEventListener('change', () => setHudVisible(ui.setHud.checked));
 
 /* 画质滑块：拖动时只更新本地显示，松手才下发 QP，避免刷爆控制流；
    手动拖 QP 即进入「自定义」，策略不再覆盖 */
