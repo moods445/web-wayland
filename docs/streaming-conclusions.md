@@ -6,8 +6,14 @@
 
 - **4K@60fps 已达成**：独显（GTX 1050 Ti / card0）路径 `wwcap --capture sc` 实测 **59.6~60.2 fps**，转换 0.5ms/帧、抓帧延迟 ~40ms。
 - 集显（Intel HD 630 / renderD129）路径保持 `--capture shm`，1080p@60fps。
-- 键盘、鼠标、设置面板、分辨率/帧率/编码器切换、HUD、全屏全部功能正常。
-- 自动化回归：e2e 8/8、regression 15/15 全部通过。
+- 键鼠、设置面板、分辨率/帧率/编码器切换、HUD、全屏全部功能正常。
+- **三档串流策略**：平衡（QP20）/ 流畅优先（目标 60/30，QP24~30 自适应）/ 画质优先（QP16）；
+  策略只改 QP 与帧率，分辨率固定。
+- **4:4:4 色度**：NVENC 支持（`yuv444p` + High 4:4:4/244，码率 +30~50%，1080p 仍 55~60fps）；
+  VAAPI 不支持，前端按 `/capabilities` 置灰。客户端解析 SPS 变化自动重建解码器。
+- **服务常驻**：systemd 用户单元 + linger 开机自启；无会话 30 秒自动休眠（停抓帧、销毁编码器），
+  新连接立即唤醒并强制 IDR。
+- 自动化回归：e2e 8/8、regression 33/33 全部通过（用例见 `docs/TEST-CASES.md`）。
 
 ## 2. 已修复的功能 bug（本轮）
 
@@ -125,7 +131,7 @@ capture/build/wwcap --video /run/user/1000/ww-video.sock \
 - `scripts/switch-gpu.sh`（nvidia 分支加 `--capture sc`）
 - `docs/streaming-conclusions.md`（本文）
 - `web/src/main.js`、`web/src/transport.js`、`web/src/decoder.js`（6 个 bug 修复 + 档位断言）
-- `scripts/regression-test.mjs`（新增，15 项全功能回归）
+- `scripts/regression-test.mjs`（新增，现为 33 项全功能回归）
 - `scripts/perf-test.mjs`（新增，逐分辨率帧率实测）
 
 ## 8. 复现测试的命令
@@ -134,11 +140,14 @@ capture/build/wwcap --video /run/user/1000/ww-video.sock \
 # e2e（8 项）
 node scripts/e2e-test.mjs 9222 14000
 
-# 全功能回归（15 项）
+# 全功能回归（33 项）
 node scripts/regression-test.mjs 9223 14000
 
 # 分辨率性能实测
 node scripts/perf-test.mjs 9224
 ```
+
+> 服务以 systemd 常驻时（`ww-session/ww-gateway/ww-cap`），日志看 `journalctl --user -u ww-cap -f`；
+> 重启采集用 `scripts/restart-capture.sh`，不要直接 `pkill wwcap`（会被 `Restart=always` 拉回并产生双实例）。
 
 测试后服务端如需恢复默认：`wwcap-ctrl.sock` 发 `{"t":"fps","v":0}` 与 `{"t":"mode","reset":1}`。

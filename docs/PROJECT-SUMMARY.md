@@ -30,6 +30,9 @@
 | 11 | 继续（排查键盘注入）|
 | 12 | 结论写入 docs；用 handoff 技能交接 |
 | 13 | 把所有汇总信息写入文档（本文）|
+| 14 | 三档串流策略（平衡/流畅优先/画质优先）+ 4:4:4 色度采样；策略只调 QP 与帧率，分辨率固定 |
+| 15 | 修 4:4:4 切换后客户端仍按 4:2:0 解码：解析 SPS profile 变化后等 IDR 重建解码器 |
+| 16 | 服务开机自启（systemd 用户单元 + linger）、无会话 30 秒自动休眠；补测试文档并提交 git |
 
 ---
 
@@ -46,7 +49,10 @@ wwcap (C)
   ├─ dmabuf → 每帧重建 EGLImage → GL shader 两趟出 Y/UV（sc 路径）
   ├─ PBO + fence 异步回读 12.4MB NV12（sc 路径）
   ├─ sws_scale 4 线程 ARGB→NV12（shm 路径，CPU）
-  ├─ h264_vaapi（VDEnc/CQP，集显）或 h264_nvenc（constqp/ull/p4，独显）
+  ├─ h264_vaapi（VDEnc/CQP，集显，仅 4:2:0）或 h264_nvenc（constqp/ull/p4，独显；可选 yuv444p + High 4:4:4）
+  ├─ 策略控制 QP/目标帧率（平衡/流畅优先/画质优先/自定义），分辨率始终独立
+  ├─ 音频：ww-desk monitor → Opus 48k/20ms（含 RED）→ ww-audio.sock
+  ├─ 休眠：网关通知无会话满 30s → 停抓帧、销毁编码器
   ├─ Annex-B 分片：24B 头 + SOCK_DGRAM 发到 wwgw
   └─ 反向：zwp_virtual_keyboard / zwlr_virtual_pointer 注入键鼠
   ▼ Unix DGRAM
@@ -54,14 +60,15 @@ wwgw (Rust, wtransport)
   ├─ 8443/udp  WebTransport：视频 datagram 广播，控制双向流
   ├─ 8443/tcp  HTTPS 静态托管（仅 http/1.1 ALPN）
   ├─ IP 白名单（含 IPv4-mapped IPv6 归一）+ 证书哈希钉扎
-  ├─ /healthz 健康计数；新会话即发 {"t":"kf"} 强制 IDR
+  ├─ /healthz 健康计数；/capabilities 暴露编码器与 4:4:4 能力；新会话即发 {"t":"kf"} 强制 IDR
+  ├─ 会话建立/最后一个断开发 {"t":"active","v":1|0}；空闲 30s 后 wwcap 休眠
   └─ broadcast Lagged 后请求 IDR
   ▼ WebTransport
 web (JS, 无构建)
   ├─ datagram 重组（frame_id + frag_index）
-  ├─ WebCodecs VideoDecoder（annexb，codec 由 SPS 推导）
+  ├─ WebCodecs VideoDecoder（annexb；每帧解析 SPS，profile 变化等 IDR 后重建）
   ├─ canvas 2D 上屏（等比留黑），远端光标随视频帧下发
-  ├─ 左上角设置面板（分辨率/帧率/编码器/HUD/全屏）
+  ├─ 左上角设置面板（策略/分辨率/帧率/编码器/4:4:4/HUD/全屏）
   └─ window.__ww 自测接口（status/pointer/key/requestKeyframe）
 ```
 
@@ -84,8 +91,8 @@ web (JS, 无构建)
 ### 4.2 编码
 | 文件 | 改动 |
 |---|---|
-| `capture/src/encoder_vaapi.c` | QP 生效关键：`AV_CODEC_FLAG_QSCALE` + `global_quality=qp*FF_QP2LAMBDA`；`ww_enc_create_ex(kind,drm,w,h,fps,qp)`；NVENC 后端；`ww_enc_submit_cpu()` 对 NVENC 直送 NV12；4 线程 `sws_scale` 分带转换 |
-| `capture/src/encoder.h` | `struct ww_enc` 增 `kind` 字段 |
+| `capture/src/encoder_vaapi.c` | QP 生效关键：`AV_CODEC_FLAG_QSCALE` + `global_quality=qp*FF_QP2LAMBDA`；`ww_enc_create_ex(kind,drm,w,h,fps,qp)`；NVENC 后端；`ww_enc_submit_cpu()` 对 NVENC 直送 NV12；4 线程 `sws_scale` 分带转换；本轮新增 `ww_enc_create_chroma()` / `ww_enc_probe_444()`：NVENC 用 `yuv444p` + High 4:4:4(244)，VAAPI 拒绝 4:4:4；SPS profile 诊断日志 |
+| `capture/src/encoder.h` | `struct ww_enc` 增 `kind` 字段；新增 chroma/探测接口声明 |
 
 ### 4.3 输入
 | 文件 | 改动 |
@@ -95,35 +102,46 @@ web (JS, 无构建)
 ### 4.4 传输协议
 | 文件 | 改动 |
 |---|---|
-| `proto/wire.h` | 分片头 `payload_len@12` + `pts_us@16`，packed 24 字节；删除错误的 `_reserved`（曾致 pts 错位）|
+| `proto/wire.h` | 分片头 `payload_len@12` + `pts_us@16`，packed 24 字节；删除错误的 `_reserved`（曾致 pts 错位）；新增控制消息 `strategy`（0 平衡/1 流畅/2 画质/3 自定义）与 `chroma`（1=4:4:4） |
 | `web/src/proto.js` | 与 C 端一致的解析 |
 
 ### 4.5 网关
 | 文件 | 改动 |
 |---|---|
-| `gateway/src/main.rs` | 证书路径可配 `WW_WT_CERT/WW_WT_KEY`；ACL 修 IPv4-mapped IPv6；`/healthz` + 下行计数；新会话请求 IDR；Lagged 请求 IDR；控制消息上限 64KB；`select!` 后 `down.abort()` 防泄漏 |
+| `gateway/src/main.rs` | 证书路径可配 `WW_WT_CERT/WW_WT_KEY`；ACL 修 IPv4-mapped IPv6；`/healthz` + 下行计数；新会话请求 IDR；Lagged 请求 IDR；控制消息上限 64KB；`select!` 后 `down.abort()` 防泄漏；本轮新增 `/capabilities`（读 wwcap 能力文件）、`{"t":"active","v":1|0}` 会话通知（含重启后补发）、`/restart` 流程兼容 systemd |
 
 ### 4.6 前端
 | 文件 | 改动 |
 |---|---|
-| `web/src/main.js` | 证书哈希钉扎；全屏失败不中断启动；`window.__ww` 自测接口；设置面板逻辑（`pref/requestRes/requestFps/autoMode/applyFullscreen`）；HUD fps 窗口裁剪；默认不 pointer lock（`?lock=1` 开启）；关键帧请求节流；端到端估算；本轮修 6 个 bug + 档位断言 |
-| `web/src/decoder.js` | `codecFromAnnexB()` 推导 codec；constraint 归一化 `00`、level 限 5.1；去掉 `prefer-hardware`；等首个 IDR；时间戳严格递增；error 后重建；本轮接 `onNeedKeyframe` |
-| `web/src/transport.js` | 导入 `WIRE_VERSION`；严格校验 version/fragCount/index/payloadLen；`pendingOrder` + LRU 裁剪；控制流未就绪排队；关闭清理；本轮加 `connected` 标志 |
-| `web/src/input.js` | 鼠标按 canvas 实际矩形归一化；pointer lock 后先绝对定位对齐；相对移动按 rAF 合并；**不自绘光标**（screencopy 已把 compositor 光标编进视频，再画一支会出现两个鼠标） |
-| `web/index.html` | 左上角齿轮 + 设置面板：`set-res/set-fps/set-enc/set-hud/set-fs/set-close/set-note` |
-| `web/styles/main.css` | HUD 去 blur 改实色；canvas 居中等比；齿轮/设置面板样式 |
+| `web/src/main.js` | 证书哈希钉扎；全屏失败不中断启动；`window.__ww` 自测接口；设置面板逻辑（`pref/requestRes/requestFps/autoMode/applyFullscreen`）；HUD fps 窗口裁剪；默认不 pointer lock（`?lock=1` 开启）；关键帧请求节流；端到端估算；修 6 个 bug + 档位断言；本轮新增三档策略 UI、4:4:4 开关与能力探测（`/capabilities` + `isConfigSupported`）、SPS profile 变化重建解码器、统计面板显示策略/色度 |
+| `web/src/decoder.js` | `codecFromAnnexB()` 推导 codec；constraint 归一化 `00`、level 限 5.1；去掉 `prefer-hardware`；等首个 IDR；时间戳严格递增；error 后重建；接 `onNeedKeyframe`；本轮 `codecFromAnnexB(data, strict)` 仅在有 SPS 时返回，configure 失败按 244/100 分别回退 |
+| `web/src/transport.js` | 导入 `WIRE_VERSION`；严格校验 version/fragCount/index/payloadLen；`pendingOrder` + LRU 裁剪；控制流未就绪排队；关闭清理；加 `connected` 标志 |
+| `web/src/input.js` | 鼠标按 canvas 实际矩形归一化；pointer lock 后先绝对定位对齐；相对移动按 rAF 合并；**不自绘光标**（screencopy 已把 compositor 光标编进视频，再画一支会出现两个鼠标）；本轮改为绝对只发最新位置、相对累积位移 + 滚轮，失焦/断线补发按键释放，画布外不移动指针 |
+| `web/index.html` | 齿轮 + 设置面板：`set-res/set-fps/set-enc/set-hud/set-fs/set-close/set-note`；本轮新增 `#set-strategy` 策略按钮组与 `#set-chroma` 4:4:4 开关（含不可用原因提示）|
+| `web/styles/main.css` | HUD 去 blur 改实色；canvas 居中等比；齿轮/设置面板样式；本轮新增分段按钮 `.seg` 与色度提示样式 |
 
-### 4.7 脚本与配置
+### 4.7 音频（下行）
+| 文件 | 改动 |
+|---|---|
+| `capture/src/audio.c` / `audio.h`（新建）| PipeWire 抓 `ww-desk` monitor → S16 交织 → Opus 48k/立体声/20ms → 16B 头 + RED 冗余 → `ww-audio.sock`；`astream rx` 控制启停 |
+| `web/src/audio.js` / `audio-worklet.js`（新建）| AudioDecoder(opus) → 环形缓冲（40ms 起，自适应 ≤120ms，按 seq 单调前进，小缺口用 RED 补、大缺口淡出）|
+| `scripts/audio-test-tone.sh`（新建）| 服务端放 1kHz 测试音，用于验证整条音频链路 |
+
+### 4.8 脚本与配置
 | 文件 | 改动 |
 |---|---|
 | `scripts/switch-gpu.sh`（新建）| `intel`（card1/headless 1080p/vaapi/3200x1800）与 `nvidia`（card0/headless 4K/nvenc/3840x2160）互斥切换 |
-| `scripts/run-all.sh` / `stop-all.sh` | 一键启停 Hyprland、网关、抓帧编码 |
-| `scripts/cdp-shot.mjs` / `e2e-test.mjs` | CDP 截图与端到端断言工具 |
-| `scripts/regression-test.mjs`（新建）| 15 项全功能回归 |
+| `scripts/run-all.sh` / `stop-all.sh` | 一键启停 Hyprland、网关、抓帧编码；本轮 Hyprland 显式 `--config`，`stop-all.sh` 检测到 systemd 时改走 `systemctl stop` |
+| `scripts/install-services.sh`（新建）| 安装 `ww-*.service` 到 `~/.config/systemd/user`、`daemon-reload`、`enable-linger`、按需启动 |
+| `scripts/ww-cap-start.sh`（新建）| systemd 启动器：等 Wayland socket → 复用/新建 HEADLESS 输出（1080p scale 1）→ exec wwcap |
+| `scripts/restart-capture.sh`（新建）| 网页「重启采集/强制恢复桌面」：先 `forcerendererreload`，systemd 下改用 `systemctl restart`，避免双实例 |
+| `scripts/cdp-shot.mjs` / `e2e-test.mjs` | CDP 截图与 8 项端到端断言工具 |
+| `scripts/regression-test.mjs`（新建）| 33 项全功能回归（含策略、色度可观测、4:4:4 往返、音频、输入）|
 | `scripts/perf-test.mjs`（新建）| 逐分辨率帧率实测 |
-| `scripts/ww-session.service` / `ww-gateway.service` / `ww-cap.service` | systemd 常驻单元 |
+| `scripts/pipewire/50-ww-desk.conf`（新建）| 虚拟 sink `ww-desk`（只抓应用声音，避免混入麦克风）|
+| `scripts/ww-session.service` / `ww-gateway.service` / `ww-cap.service` | systemd 常驻单元；`ww-cap` 用启动器 + `Restart=always`，无会话 30s 休眠 |
 | `config/hypr/hyprland.conf` | `accel_profile=flat` + `force_no_accel`；`SUPER+Enter`→foot，`SUPER+D`→fuzzel |
-| `README.md` / `docs/architecture.md` / `docs/streaming-conclusions.md` / 本文 | 文档 |
+| `README.md` / `docs/architecture.md` / `docs/streaming-conclusions.md` / `docs/TEST-CASES.md` / 本文 | 文档 |
 
 ---
 
@@ -181,12 +199,21 @@ web (JS, 无构建)
 | 6 | 低 | debug 字节恒 0KB | 用 `bytesThisTick` 且去重 DEBUG 赋值 |
 | 7 | 低 | e2e 分辨率断言失配（937 vs 1080）| `autoMode()` 按服务端 16:9 档位记录预期值 |
 
+### 5.7 本轮 bug（串流策略 / 4:4:4 / 自启休眠）
+| # | 问题 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 切 4:4:4 后服务端已是 `profile_idc=244`，前端统计仍显示 `4:2:0` | ① 诊断浏览器缓存了旧 `main.js`；② 判断依赖关键帧携带 SPS | `codecFromAnnexB(data, strict)` 仅在有 SPS 时返回；等带 SPS 的 IDR 后 `useCodec()` 重建解码器；用全新 profile 复测确认 |
+| 2 | systemd 新会话里鼠标位移只有一半、`hyprctl dispatch/keyword` 语法全变 | Hyprland 0.55 默认优先加载 `hyprland.lua`，未指定 `--config` 时退回 `/usr/share/hypr` 示例配置（HEADLESS scale 2） | systemd 单元与 `run-all.sh` 统一 `start-hyprland -- --config ~/.config/hypr/hyprland.conf` |
+| 3 | 手动 `pkill wwcap` 后出现两份 wwcap 抢 socket | systemd `Restart=always` 先拉起一份，`restart-capture.sh` 又手工起一份 | 脚本检测 `ww-cap` 为 active 时改走 `systemctl restart`；`stop-all.sh` 同理 |
+| 4 | 休眠唤醒后首帧慢/可能花屏 | 新会话没有 IDR，且编码器是刚重建的 | 唤醒时 `need_idr=1`，网关会话建立同时下发 `kf` |
+
 ---
 
 ## 6. 性能实测
 
 ### 6.1 各阶段基线
 - 1080p：约 58–60fps（早期优化后稳定）。
+- 1080p + NVENC 4:4:4：仍 ~55–60fps（编码开销增加但未成瓶颈），码率约 +30~50%。
 - 4K 用 shm 正确抓帧：约 15–22fps。
 - 旧 dmabuf 路径曾测到 NVENC 34–36fps，但确认抓的是黑像素，**不可作为有效方案**。
 
@@ -229,11 +256,13 @@ web (JS, 无构建)
 | 工具 | 用途 | 最新结果 |
 |---|---|---|
 | `scripts/e2e-test.mjs` | 8 项端到端断言（连接/分片/渲染/丢片/分辨率/队列/解码）| 8/8 通过 |
-| `scripts/regression-test.mjs` | 15 项全功能（非黑屏/面板/帧率/编码器切换/HUD/输入/无 JS 错误）| 15/15 通过 |
+| `scripts/regression-test.mjs` | 33 项全功能（非黑屏/面板/策略/色度可观测/4:4:4 往返/帧率/编码器切换/HUD/输入/音频/无 JS 错误）| 33/33 通过 |
+| `docs/TEST-CASES.md` | 用例台账（A~N 分类：连接、渲染、设置、输入、鼠标、稳定性、音频、串流策略、色度、自启休眠）| 与脚本一一对应 |
 | `scripts/perf-test.mjs` | 逐分辨率帧率实测 | 见表 6.2 |
 | `scripts/cdp-shot.mjs` | CDP 截图 | 截图确认顶栏/壁纸/面板正常 |
 | `window.__ww` | 页面内自测接口 | status/pointer/key/requestKeyframe |
 | `/healthz` | 网关健康计数 | ok:true，sessions/datagrams 正常 |
+| `/capabilities` | 编码器与 4:4:4 能力 | `{"chroma444":0/1,"encoder":"vaapi"/"nvenc"}` |
 
 测试后恢复默认：向 `wwcap-ctrl.sock` 发 `{"t":"fps","v":0}` 与 `{"t":"mode","reset":1}`。
 
@@ -241,16 +270,19 @@ web (JS, 无构建)
 
 ## 8. 当前状态与已知限制
 
-**当前状态**：集显路径串流稳定 1080p@60fps；独显零拷贝路径 4K@60fps；所有功能正常；测试全绿。
+**当前状态**：集显路径 1080p@60fps、独显零拷贝 4K@60fps；三档串流策略与 4:4:4（NVENC）生效；
+服务由 systemd 用户单元开机自启，无会话 30 秒自动休眠；E2E 8/8、回归 33/33 全绿。
 
 **已知限制**：
-- 光标形状非真实位图（前端画固定箭头）；`ext_image_copy_capture_cursor_session` 未接入。
-- 自适应控制器仅 QP 单旋钮；AIMD 与丢包反馈闭环未接（`stats` 已上报，服务端未消费）。
+- 4:4:4 仅 NVENC（独显）支持；Intel VAAPI 只有 4:2:0，前端会置灰并说明原因。
+- 4:4:4 码率约 +30~50%，未做按场景自动选择。
+- 画质优先在 4K 下受硬件限制约 20fps；流畅优先的 QP 自适应只依据实测帧率，未接丢包反馈（`stats` 已上报，服务端未消费）。
 - 4K60 只在独显 `--capture sc` 路径达成；集显 shm 路径 4K 仍 ~22fps。
-- NVENC 仍是从主机内存 NV12 上传（PBO 回读后 memcpy），尚未做显存直连。
+- NVENC 仍是从主机内存 NV12/YUV444P 上传（PBO 回读后 memcpy），尚未做显存直连。
 - 音频只做下行（PipeWire monitor → Opus → AudioWorklet）；麦克风上行、剪贴板、文件传输不在本期范围。
 - 音频码率固定 64kbps，不做 ABR；仅按客户端上报丢包率开关 RED 冗余（见 README 音频章节）。
-- 该工作区**不是 git 仓库**，`git status` 不可用。
+- 休眠唤醒到首帧约 1 秒（重建编码器 + 强制 IDR）。
+- 仓库已 `git init` 并完成首次功能提交；后续改动照常提交。
 
 ---
 
@@ -271,8 +303,12 @@ web (JS, 无构建)
 ## 10. 环境 / 运行事实
 
 - `XDG_RUNTIME_DIR=/run/user/1000`、`WAYLAND_DISPLAY=wayland-1`、Hyprland 实例签名取 `$XDG_RUNTIME_DIR/hypr/` 最新目录。
-- 网关 `wwgw`（cwd 必须是项目根）静态托管 `web/`，HTTPS+WebTransport 均 :8443；前端 JS 改动即时生效，C 代码需 `cd capture/build && meson compile`。
-- 抓帧命令：`wwcap --video /run/user/1000/ww-video.sock --ctrl /run/user/1000/wwcap-ctrl.sock --capture shm --enc vaapi --output HEADLESS-1 --max 3200x1800`，日志 `/tmp/wwcap.log`。
+- 抓帧命令：`wwcap --video /run/user/1000/ww-video.sock --ctrl /run/user/1000/wwcap-ctrl.sock --audio /run/user/1000/ww-audio.sock --capture shm --enc vaapi --output HEADLESS-2 --max 3200x1800`。
+- 常驻方式（推荐）：`systemctl --user status ww-session ww-gateway ww-cap`，日志 `journalctl --user -u ww-cap -f`；手动调试用 `scripts/run-all.sh`，两者不要同时跑。
+- 重启采集统一走 `scripts/restart-capture.sh`（systemd 下自动改用 `systemctl restart`），不要直接 `pkill wwcap`。
+- 无会话 30 秒后 wwcap 自动休眠（停抓帧、销毁编码器），有连接立即唤醒并强制 IDR。
+- Hyprland 启动必须带 `--config ~/.config/hypr/hyprland.conf`（0.55 默认会加载 `/usr/share/hypr/hyprland.lua`）。
+- 前端 JS 改动即时生效（网关从磁盘读 `web/`），C/Rust 改动需重新 `meson compile` / `cargo build --release` 并重启对应单元。
 - 物理屏 eDP-1 只广播 3840x2160（60/48Hz），不能配成 1080p（会变成 0x0 而抓不到帧）；串流一律抓 headless 输出，`hyprland.conf` 里 eDP-1 用 `preferred`。
 - 控制协议：Unix DGRAM `wwcap-ctrl.sock`，一条报文一条 JSON（如 `{"t":"kk","k":125,"d":1}`）。
 

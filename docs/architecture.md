@@ -19,12 +19,14 @@ wwgw (Rust, wtransport)
   ├─ 8443/udp  WebTransport：视频/音频都走 datagram 广播（首字节 1=视频、2=音频），控制走双向流
   ├─ 8443/tcp  HTTPS 静态托管（仅 http/1.1 ALPN）
   ├─ 192.168.0.0/24 白名单（含 IPv4-mapped IPv6 归一）
-  ├─ 新会话建立即向 wwcap 发 {"t":"kf"} 与 {"t":"astream","rx":1}
+  ├─ 新会话建立即向 wwcap 发 {"t":"kf"}、{"t":"astream","rx":1} 与 {"t":"active","v":1}
+  ├─ 最后一个会话断开发 {"t":"active","v":0}：wwcap 空闲 30s 后休眠（停抓帧、销毁编码器）
+  ├─ /capabilities 读取 wwcap 写出的色度能力（NVENC 支持 4:4:4，VAAPI 不支持）
   └─ astats 丢包反馈 → {"t":"ared"} 开关 RED 冗余
   ▼ WebTransport
 web (JS, 无构建)
   ├─ datagram 按首字节分流：1 → 视频重组（frame_id + frag_index），2 → 音频包
-  ├─ WebCodecs VideoDecoder（annexb，codec 由 SPS 推导）
+  ├─ WebCodecs VideoDecoder（annexb；每帧解析 SPS，profile 变化时等 IDR 后重建解码器）
   ├─ WebCodecs AudioDecoder(opus) → AudioWorklet 环形缓冲（40ms 起，自适应 ≤120ms）
   ├─ canvas 2D 上屏（drawImage(VideoFrame)，等比留黑）
   └─ 键鼠捕获 → 控制流回传
@@ -41,16 +43,23 @@ web (JS, 无构建)
 | 端到端浏览器 | 3840×2160 解码上屏成功（headless Chrome + 软件 H.264） |
 | 静态桌面码率 | ~0 Mbps（全黑+静止）；实际交互时按 QP 与变化面积变化 |
 
-## 码控策略（CQP 单旋钮）
+## 码控策略（CQP + 三档预设）
 
-硬件只支持 CQP，因此自适应控制器不调码率，而是调 QP：
+硬件只支持 CQP，因此画质控制全部落在 QP 上；**策略与分辨率解耦**，策略永不改分辨率：
 
-- QP 22 = 高画质（静止页面、演示）
-- QP 26 = 默认
-- QP 30–34 = 网络抖动/带宽紧张时降档
-- 改 QP 后强制一次 IDR，避免新旧质量段混在预测链里
+| 策略 | QP | 目标帧率 |
+|---|---|---|
+| 平衡（默认）| 20 | 跟随分辨率档位（默认 60）|
+| 流畅优先 | 24~30，按每秒实测帧率浮动 | 60 或 30（仅这两档）|
+| 画质优先 | 16 固定 | 不设目标（4K 下受硬件限制约 20fps）|
+| 自定义 | 手动滑块 16~30 | 跟随分辨率档位 |
 
-降档顺序：**先降帧率（60→45→30），再降 QP，最后才降分辨率**（与"清晰优先"一致）。
+- 改策略/QP 后强制一次 IDR，避免新旧质量段混在预测链里。
+- 流畅优先用服务端 1 秒统计块做反馈：低于目标帧率就抬 QP（最多 30），高于目标就降回 24。
+- 分辨率仍由下拉框决定；自动模式保留「先降帧率、再降分辨率」的顺序。
+- **4:4:4 是独立维度**：NVENC 走 `yuv444p` + High 4:4:4 Predictive（244），VAAPI 只有 4:2:0。
+  服务端试开探测写 caps 文件，网关 `/capabilities` 下发，前端据此置灰/恢复开关。
+  码率约 +30~50%，适合文字/彩色边缘，不适合带宽紧张的场景。
 
 ## 为什么不需要 fork Hyprland / 写插件
 
@@ -63,7 +72,9 @@ web (JS, 无构建)
 
 | 项 | 现状 |
 |---|---|
-| Hyprland | `LIBSEAT_BACKEND=seatd` + `AQ_DRM_DEVICES=/dev/dri/card1` + `start-hyprland` |
+| Hyprland | `LIBSEAT_BACKEND=seatd` + `AQ_DRM_DEVICES=/dev/dri/card1` + `start-hyprland -- --config ~/.config/hypr/hyprland.conf` |
+| 开机自启 | `ww-session` / `ww-gateway` / `ww-cap` 三个 systemd 用户单元 + `loginctl enable-linger`，无需登录图形界面 |
+| 空闲休眠 | 网关通知 `active` 会话数；无客户端 30s 后 wwcap 停抓帧、销毁编码器，新连接唤醒并强制 IDR |
 | seatd | 必需（SSH 会话无 seat，libseat 否则拒绝 DRM） |
 | X11 / LXQt / Sunshine | **已停用**（iGPU 的 DRM master 唯一） |
 | 回滚 | `sudo systemctl start sddm` + `systemctl --user start app-dev.lizardbyte.app.Sunshine.service` |
@@ -79,3 +90,10 @@ web (JS, 无构建)
 6. 网关 HTTPS 的 ALPN 不能给 `h2`（curl/Chrome 会等 SETTINGS 帧而报协议错误）。
 7. `gbm_bo_map` 在 i915 + mesa 26 上 `unmap` 会崩（libgallium 内部），因此只做常驻映射、永不 unmap。
 8. 新客户端拿到首帧前必须先有 IDR：网关在会话建立时下发 `kf`。
+9. Hyprland 0.55 默认优先加载 `hyprland.lua`：不带 `--config` 会退回 `/usr/share/hypr/hyprland.lua`，
+   表现为 HEADLESS 输出变成 scale 2、`hyprctl keyword/dispatch` 语法全变、鼠标坐标映射减半。
+   所有启动路径（systemd 单元、`run-all.sh`）都必须显式指定 `~/.config/hypr/hyprland.conf`。
+10. 客户端 codec 不能写死：切 4:4:4 后 SPS profile 从 `0x64` 变 `0xf4`，必须在带 SPS 的关键帧上
+    重建解码器；否则继续用旧配置喂 4:4:4 码流会直接解码报错。constraint 字节保持 `00`。
+11. systemd 管理下不要直接 `pkill wwcap`：`Restart=always` 会立刻拉起，再手工起一份就会有两份
+    抢同一对 socket；统一走 `scripts/restart-capture.sh`（内部检测到 systemd 会改用 `systemctl`）。

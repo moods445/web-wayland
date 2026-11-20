@@ -73,6 +73,25 @@ journalctl --user -u ww-cap -f         # 抓帧 / 休眠日志
 
 手动切换：`./scripts/set-mode.sh 1920x1080@60`（或用 `hyprctl keyword monitor` 直接改，wwcap 会自愈重建编码器）。
 
+## 串流策略与 4:4:4 色度
+
+设置面板「分辨率与帧率」顶部是三档策略，**只改 QP 与目标帧率，分辨率始终由下拉框决定**：
+
+| 策略 | QP | 目标帧率 | 适用 |
+|---|---|---|---|
+| 平衡（默认）| 20 | 跟随下拉（默认 60）| 日常使用，清晰与带宽兼顾 |
+| 流畅优先 | 24~30 按实测帧率浮动 | 60 或 30（仅这两档）| 网络波动大、优先保证跟手 |
+| 画质优先 | 16 固定 | 不设目标 | 静态文档/演示；4K 下受硬件限制约 20fps |
+| 自定义 | 手动拖画质滑块 | 跟随下拉 | 手动指定 QP 后自动进入 |
+
+- 策略下发 `{"t":"strategy","v":0..3}`，服务端立即改 QP、重建编码器并强制 IDR。
+- **4:4:4 色度**是独立开关：NVENC 走 `yuv444p` + High 4:4:4 Predictive（`profile_idc=244`，
+  codec 串 `avc1.f4xx`），文字/彩色边缘明显更锐利，代价是码率约 +30~50%。
+- 集显 VAAPI 只支持 4:2:0：服务端试开探测后写能力文件，网关 `/capabilities` 暴露给前端，
+  不支持时开关置灰并显示原因；切到 NVENC 会自动恢复。
+- 客户端不写死 codec：每帧解析 Annex-B 的 SPS，profile 变化时等 IDR 后重建解码器，
+  统计面板会显示实际生效的色度（`4:2:0` / `4:4:4`）。
+
 ## 音频（下行已支持，上行麦克风在二期）
 
 ```
@@ -149,6 +168,9 @@ bash scripts/restart-capture.sh --deep   # 等价于「强制恢复桌面」
 4K 上不去的根因是 **HD 630 没有 VPP**（`vainfo` 无 `VAEntrypointVideoProc`），色彩转换只能走 CPU；
 加上 VDEnc 自身 4K 约 16ms，硬件上限就在 17–20fps。
 
+独显路径（`./scripts/switch-gpu.sh nvidia`，`--capture sc --enc nvenc`）可做到 4K@60；
+1080p 下打开 4:4:4 仍 55~60fps，码率约 +30~50%。
+
 ## 关键约束（实测得出，改动前务必阅读）
 
 1. **iGPU 被 Xorg 占用时无法启动 Hyprland**。DRM master 一张卡只能有一个；若 LXQt/Xorg 在跑，要么停掉它，要么按下面的方式让 Hyprland 用独显。
@@ -165,6 +187,8 @@ bash scripts/restart-capture.sh --deep   # 等价于「强制恢复桌面」
    音频包头固定 16 字节，改字段必须同步 `web/src/proto.js` 的 `parseAudio`，否则音频会静默无声。
    另：Opus 编码/发送在 PipeWire RT 回调里完成，**不要**在该路径上加锁或做重活。
 10. **统计面板的 Host processing latency 无法实现**：24 字节协议头里只有 `pts_us`（主机时钟），没有采集/编码时间戳，跨机时钟不可比，因此该项固定显示 `- / - / - ms`。网络延迟由控制流 `ping/pong` 测量（网关直接回环，不经过 wwcap），与 QUIC 内部 RTT 可能略有差异。
+11. **Hyprland 0.55 默认优先加载 `hyprland.lua`**：启动必须显式 `--config ~/.config/hypr/hyprland.conf`，否则会退回 `/usr/share/hypr/hyprland.lua`，表现为 HEADLESS 输出 scale 2、`hyprctl keyword/dispatch` 走 Lua 语法、鼠标位移减半。
+12. **systemd 常驻时不要直接 `pkill wwcap`**：`ww-cap.service` 是 `Restart=always`，会被立刻拉回；统一用 `scripts/restart-capture.sh`（重启采集）或 `scripts/stop-all.sh`（停服务）。
 
 ## 已修复的坑（本轮）
 
@@ -183,8 +207,11 @@ bash scripts/restart-capture.sh --deep   # 等价于「强制恢复桌面」
 | 控制消息可打爆内存 | 网关未限制消息长度 | 上限 64KB |
 | 桌面纯黑、没有壁纸 | `hyprpaper 0.8.4` 在 headless 输出上报 `no target`，不绘制 | 改用 `swaybg -i ... -m fill` |
 | 4K 下 UI 极小、几乎看不清 | 4K 仍用 scale 1，逻辑分辨率也是 4K | 协商时按 DPR 设 scale（4K → 2x），逻辑仍 1920×1080 |
-| 指针锁定后光标消失 | 锁定即隐藏本地光标 | 用累积位移驱动自绘光标，始终可见 |
+| 出现两个鼠标 / 锁定后"没有光标" | screencopy 已把 compositor 光标编进视频帧，前端再画一支就重复 | 去掉前端自绘光标，直接看视频里的真实光标 |
 | 切换分辨率后画面冻结 | 编码器尺寸固定，重建判断基准用错 | 以「编码器实际尺寸」为准重建 + 强制 IDR |
+| 切 4:4:4 后前端仍显示 4:2:0 | 浏览器缓存旧 JS；且判断依赖"关键帧一定带 SPS" | SPS 严格解析 + 带 SPS 的 IDR 到达后重建解码器 |
+| 新桌面里鼠标位移减半、`hyprctl` 语法全变 | Hyprland 0.55 默认优先加载 `hyprland.lua`，没指定 `--config` 就用了 `/usr/share/hypr` 示例配置（HEADLESS scale 2） | 所有启动路径显式 `--config ~/.config/hypr/hyprland.conf` |
+| systemd 管理下出现两份 wwcap 抢 socket | `Restart=always` 自动拉起 + 脚本又手工起一份 | 重启/停止脚本检测到 systemd 后改走 `systemctl` |
 
 ## 验收
 
@@ -200,10 +227,12 @@ node scripts/cdp-shot.mjs 9222 /tmp/live.png 8000
 
 ## 已知限制
 
-- 光标形状未取真实位图：视频里不含光标，前端画固定箭头；`ext_image_copy_capture_cursor_session` 的位图/热点尚未接入（要"看到真实光标形状"需补这一步）。
-- 自适应控制器只做了 QP 单旋钮；AIMD 与丢包反馈的闭环尚未接上（`stats` 消息已上报，服务端未消费）。
-- 4K 物理极限 ~17–23fps（无 VPP，CPU 转换）；1080p 55–58fps。
+- 4:4:4 仅 NVENC（独显）支持；Intel VAAPI 只有 4:2:0，开关会置灰并给出原因。4:4:4 码率约 +30~50%。
+- 参数自适应只覆盖 QP/目标帧率（三档策略）；丢包反馈的 QP 闭环尚未接上（`stats` 消息已上报，服务端未消费）。
+- 集显 shm 路径 4K 物理极限 ~17–23fps（无 VPP，CPU 转换）；4K60 需要独显 `--capture sc` 零拷贝路径。
+- 光标随视频帧下发（compositor 渲染进画面），前端不再自绘；真实光标位图/热点未单独接入。
 - 音频只做**下行**（整机混音）；浏览器麦克风上行（服务端 `ww-mic` 虚拟麦克风）与 waybar
   「远程麦克风使用中」指示属于二期，协议里已预留 `WW_IPC_AUDIO_UP` 与尾帧 `reserved` 字段。
 - 音频不做码率自适应：固定 64kbps，仅按客户端上报的丢包率开关 RED 冗余（>2% 开，<0.2% 关）。
+- 休眠唤醒到首帧约 1 秒（重建编码器 + 强制 IDR）。
 - 剪贴板、文件传输不在本期范围。
