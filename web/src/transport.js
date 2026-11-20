@@ -134,7 +134,7 @@ export class Transport {
     const data = new Uint8Array(len);
     let off = 0;
     for (const p of f.frags) { data.set(p, off); off += p.length; }
-    this.hooks.onChunk?.({ data, key: f.key, ptsUs: f.pts, arrivedAt: performance.now() });
+    this.hooks.onChunk?.({ data, key: f.key, ptsUs: f.pts, frameId: f.id, arrivedAt: performance.now() });
   }
 
   /* ── 控制流 ── */

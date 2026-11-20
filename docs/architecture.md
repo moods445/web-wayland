@@ -13,7 +13,9 @@ wwcap (C)
   ├─ Annex-B 访问单元按 1100B 切片，写 24B 头后 SOCK_DGRAM 发到 wwgw（ww-video.sock）
   ├─ PipeWire 默认 sink 的 monitor → Opus 48k/立体声/20ms → 16B 头（首字节 2）+ RED 冗余
   │    → ww-audio.sock（独立 socket，避免排在视频分片后面）
-  └─ 反向：virtual-keyboard / virtual-pointer 注入键鼠
+  ├─ 反向：virtual-keyboard / virtual-pointer 注入键鼠
+  └─ 追踪埋点：每条输入记「收到→注入」、每帧记 id/pts/字节/发送时刻/注入光标坐标
+       → 每 5 秒追加 /tmp/wwcap-trace.jsonl（2MB 轮转）
   ▼ Unix DGRAM
 wwgw (Rust, wtransport)
   ├─ 8443/udp  WebTransport：视频/音频都走 datagram 广播（首字节 1=视频、2=音频），控制走双向流
@@ -21,7 +23,8 @@ wwgw (Rust, wtransport)
   ├─ 192.168.0.0/24 白名单（含 IPv4-mapped IPv6 归一）
   ├─ 新会话建立即向 wwcap 发 {"t":"kf"}、{"t":"astream","rx":1} 与 {"t":"active","v":1}
   ├─ 最后一个会话断开发 {"t":"active","v":0}：wwcap 空闲 30s 后休眠（停抓帧、销毁编码器）
-  ├─ /capabilities 读取 wwcap 写出的色度能力（NVENC 支持 4:4:4，VAAPI 不支持）
+  ├─ /capabilities 读取 wwcap 写出的能力（色度 4:4:4 / 码控 cbr|cqp / 光标 local|server）
+  ├─ /trace 返回服务端追踪；POST /trace-upload 追加客户端追踪（NDJSON，各 2MB 轮转）
   └─ astats 丢包反馈 → {"t":"ared"} 开关 RED 冗余
   ▼ WebTransport
 web (JS, 无构建)
@@ -29,8 +32,15 @@ web (JS, 无构建)
   ├─ WebCodecs VideoDecoder（annexb；每帧解析 SPS，profile 变化时等 IDR 后重建解码器）
   ├─ WebCodecs AudioDecoder(opus) → AudioWorklet 环形缓冲（40ms 起，自适应 ≤120ms）
   ├─ canvas 2D 上屏（drawImage(VideoFrame)，等比留黑）
-  └─ 键鼠捕获 → 控制流回传
+  ├─ 光标：服务端已用透明主题把 compositor 光标去掉，客户端自绘 SVG 箭头
+  │    （transform 跟随系统指针，0ms；`WW_CURSOR=server` 可回退）
+  └─ 键鼠捕获 → 控制流回传；追踪窗口每 15s 自动 POST 到 /trace-upload
 ```
+
+> 抓帧实现有两套：默认 `--capture shm` 走 `wlr-screencopy + wl_shm`（ARGB→NV12 用 CPU）；
+> `--capture dmabuf` 才是 ext-image-copy-capture + dmabuf（本机实测读出来全黑，不用于生产）；
+> `--capture sc` 是 GL 零拷贝（dmabuf → EGLImage → GL shader 转 NV12 → PBO 回读），
+> 4K60 只有它 + NVENC 能跑通。
 
 ## 实测数字（本机：i7-7700HQ / HD 630 / eDP-1 4K）
 

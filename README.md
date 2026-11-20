@@ -92,6 +92,25 @@ journalctl --user -u ww-cap -f         # 抓帧 / 休眠日志
 - 客户端不写死 codec：每帧解析 Annex-B 的 SPS，profile 变化时等 IDR 后重建解码器，
   统计面板会显示实际生效的色度（`4:2:0` / `4:4:4`）。
 
+### 目标码率（CBR）：设置里设，统计里看
+
+设置面板「码率」滑块 0~80 Mbps（`0` = 关闭，回到 QP 控制），下发 `{"t":"bitrate","v":<bps>}`：
+
+- 服务端先查驱动的码控能力（`vaGetConfigAttributes(VAConfigAttribRateControl)`），
+  **支持 CBR** 才按目标码率编码（`rc=cbr` + `bitrate/maxrate/bufsize`，NVENC 全系支持）；
+  不支持就清掉目标码率并回退 CQP，能力通过 `/capabilities` 的 `rc` 字段（`cbr` / `cqp`）上报，
+  前端据此置灰滑块并写明原因。HD 630 实测只有 `VA_RC_CQP`：
+  `Driver does not support CBR RC mode (supported modes: CQP)`。
+- 码率生效时 **QP 不再参与码控**，设置里的「画质」滑块自动置灰，避免"拖了没反应"。
+- **实际码率**在状态叠层（`实际码率`）与 STATISTICS 面板（`Video bitrate`）显示，按 1 秒窗口
+  统计客户端收到的字节（含音频），与设置的对照关系一眼可见。
+- CQP 下实际码率随画面复杂度浮动：静态桌面 + QP 20 只有 **0.04~0.10 Mbps**（15 kbps 视频 +
+  25 kbps 音频），这是 skip 帧的正常结果，不是限速。
+- 开机自启可用 `WW_BITRATE=20 systemctl --user restart ww-cap` 指定（Mbps），
+  手动等价：`wwcap ... --bitrate 20`。
+- 高码率会放大分片量（80 Mbps ≈ 9000 分片/秒）：网关的广播队列已从 512 增到 2048
+  （约 4 帧），日志也从「每 300 片打印」改成「每 5 秒打印」，否则 journald 会被刷爆。
+
 ## 音频（下行已支持，上行麦克风在二期）
 
 ```
@@ -150,34 +169,112 @@ bash scripts/restart-capture.sh --deep   # 等价于「强制恢复桌面」
 > 根因提醒：Hyprland 的 `wlr-screencopy` 一旦卡住，`wwcap` 进程还活着但一直 `0 fps`，
 > 而且**只杀进程不够**（拷贝请求留在合成器里），所以脚本必须先 `forcerendererreload`。
 
+## 鼠标卡顿怎么查（常开追踪，自动上传）
+
+设置面板「输入追踪」是常开的纯内存记录，**每 15 秒自动 POST 到服务器**（单次延迟 >120ms 时立刻补一份），
+用户不需要做任何操作。觉得卡就复现几下，然后在服务器上：
+
+```bash
+node scripts/trace-report.mjs          # 自动读 /tmp/ww-client-trace.json + /tmp/wwcap-trace.json
+node scripts/trace-report.mjs --worst 20
+node scripts/trace-report.mjs ww-trace-*.json   # 也可以用「导出追踪」得到的合并文件
+```
+
+- 客户端（`web/src/trace.js`）：每条输入带 `performance.now()`，记帧到达/解码/上屏，
+  逐条算「输入 → 上屏」延迟；上传的是"最近 2000 条事件 + 400 条延迟样本"的滚动窗口，
+  任意一份都够回放刚卡的那一下；
+- 网关（`POST /trace-upload`）：**追加**到 `ww-client-trace.jsonl`（不覆盖，可直接 `tail -f`）；
+- 服务端（`capture/src/main.c`）：每条输入记「网关收到 → 注入完成」，每帧记帧号/pts/字节/发送时刻，
+  每 5 秒把**新增**记录追加到 `wwcap-trace.jsonl`。
+
+两边都是 NDJSON，一行一条记录，可以直接看/过滤：
+
+```bash
+tail -f /tmp/ww-client-trace.jsonl | jq -c 'select(.type=="pair" and .lag>80)'
+grep '"type":"in"' /tmp/wwcap-trace.jsonl | tail -5
+```
+
+| 文件 | 记录类型 | 上限 |
+|---|---|---|
+| `ww-client-trace.jsonl` + `.jsonl.1` | `snap`（统计头）/ `ev`（输入·帧事件）/ `pair`（逐条延迟）| 每份 2MB（`WW_TRACE_MAX_BYTES` 可调），轮转只留一份旧档 |
+| `wwcap-trace.jsonl` + `.jsonl.1` | `in`（输入：收到→注入耗时）/ `frm`（出帧）| 同上 2MB |
+| **合计** | | **≈ 8MB 上限**（实际追加速率：客户端 ~95KB/15s、服务端 ~4KB/s）|
+
+`/tmp` 是 tmpfs，占用即内存；需要跨重启保留就设 `WW_TRACE_DIR=/var/tmp`。
+上传侧还有 1.5 秒限速（同一网关只接受一份），多标签页/异常重连不会把盘刷爆。
+
+判读：`up` 大 → 控制流排队；`inject` 大 → wwcap 主循环被占满；`rest` 大 → 等帧/编码/下行/解码；
+`lag` 抖动大 → 掉帧或关键帧风暴。统计面板的 `Input → screen latency` 行可实时看到 p50/p95/max。
+
+**光标可见延迟（真正的"卡不卡"指标）**：`wwcap` 每帧记录当次注入的指针归一化坐标（`frm.cx/cy`），
+客户端记录自己的指针轨迹（`ev kind=pm`）。报告用**位置匹配**而不是对钟：拿画面里光标的坐标，
+在客户端轨迹里找"手最后一次位于该坐标"的时刻，差值就是这帧画面里光标落后了多少毫秒。
+
+```
+=== 光标可见延迟（画面里的光标 vs 手的位置）===
+n=132  p50 38.8ms  p90 48.6ms  p99 57.3ms  max 78.6ms
+```
+
+因为光标是编进视频的，这个值天然等于"两三个帧的管线延迟"；它才是用户感受到的拖手程度。
+不是"输入 → 首个上屏帧"（那只证明有新帧，不证明帧里的光标动了，会显得一切正常）。
+
+> 以上是**改造前**的基线。改成下面的本地光标后，这个指标应当降到 ≈0（光标不再经过视频链路），
+> 报告里它现在用来验证"本地光标是不是真的生效了"。
+
+## 本地光标（延迟 0ms）
+
+上一节那个 26~50ms 是"光标在视频里"的固有代价，调参压不下去。默认部署已经改成**客户端自绘光标**：
+
+- **服务端**：用全透明 xcursor 主题 `ww-invisible` 让合成器不把光标画进画面。
+  关键约束：`hyprctl setcursor` 对 Xcursor 主题**运行时无效**（实测红/透明主题都不生效，
+  只有重启时通过 `XCURSOR_THEME` 才加载得到），并且必须把 `cursor:enable_hyprcursor` 关掉
+  （开着时 Hyprland 只认 `.hlc`，静默忽略）。两处都写在 `scripts/ww-session.service` 与
+  `config/hypr/hyprland.conf` 里。
+- **客户端**：`/capabilities` 的 `{"cursor":"local"}` 到达后才启用——canvas 设 `cursor:none`，
+  用一个 SVG 箭头 `#cursor-local` 通过 `transform: translate3d()` 跟随真实指针，
+  每帧只改一次 transform（GPU 合成），离开画布即隐藏。
+- **代价**：光标形状只剩箭头，文本 I 形 / 缩放箭头 / 手形都没有了。
+- **回退**：`WW_CURSOR=server`（服务端回报 `cursor:"server"`）+ 去掉 `XCURSOR_THEME`、
+  把 `enable_hyprcursor` 改回 `true`，然后重启 `ww-session`。
+
+主题本身是 `~/.icons/ww-invisible`（`xcursorgen` 生成，44 个常见光标名，24×24 全透明），
+新机器用 `./scripts/install-cursor-theme.sh` 重建（`--check` 只检查）。
+
 ## 实测性能
 
-| 物理输出 | 逻辑分辨率 | 帧率（服务端，无本地浏览器竞争） |
-|---|---|---|
-| 3840×2160 @2x | 1920×1080 | **22–27 fps**（GL 回读约 37ms/帧，硬上限） |
-| 3200×1800 @1.67x | ~1920×1080 | **约 30 fps** |
-| 2560×1440 @1.33x | ~1920×1080 | **约 48 fps** |
-| 1920×1080 @1x | 1920×1080 | **55–58 fps** |
+帧率均为 **服务端**（`wwcap` 日志，无浏览器竞争）；每次采样 ≥10s 稳态。
 
-单帧成本拆分（4K）：抓帧回读 ~25–37ms（合成器侧）、libyuv 转换 3.5ms、NV12 上传 6.9ms、提交 0.2ms。
-`screencopy` 走 wl_shm，回读是必经之路；已用双缓冲让「抓帧」与「转码」重叠。
-默认协商上限 `--max 3200x1800`（可用 `--max 3840x2160` 开真 4K）。
+| 抓帧路径 | 1920×1080 | 2560×1440 | 3840×2160 |
+|---|---|---|---|
+| 集显 `shm` + `vaapi`（默认）| 51~58 fps | 48~51 fps | **22 fps** |
+| 集显 `sc` + `vaapi` | **69~75 fps** | 50~52 fps | **20~22 fps** |
+| 独显 `sc` + `nvenc` | — | — | **57.3~57.6 fps** |
 
-切换：`./scripts/set-mode.sh 1920x1080@60`（编码器尺寸固定，需重启 wwcap）。
+1080p 单帧：`cap 6.9ms + conv 6.6ms`（shm 路径，CPU 转换）／`cap 16.6ms + conv 0.3ms`（sc 路径）。
+4K 单帧：shm `cap 46ms + conv 12ms`；sc `cap 30~44ms + conv 0.3~0.5ms`。
 
-4K 上不去的根因是 **HD 630 没有 VPP**（`vainfo` 无 `VAEntrypointVideoProc`），色彩转换只能走 CPU；
-加上 VDEnc 自身 4K 约 16ms，硬件上限就在 17–20fps。
+- **4K 上不去与编码器无关**：ffmpeg 直喂 4K60 最坏复杂度(约 106 Mbps)实测 VDEnc 编码 **54~58 fps**
+  （`async_depth` 1/2/4 → 54/55/58），编码器有余量。
+- **4K 的墙在抓帧节奏**：`sc` 修通后 `conv` 已降到 0.3ms，但 4K 仍是 20~22fps，`cap` 30~44ms；
+  而 shm（CPU 回读）与 sc（dmabuf+PBO）两套完全不同的实现收敛到同一个数字 →
+  限制来自 **Hyprland 在 HD 630 上合成 4K、服务 screencopy 的节拍**，不是本项目代码。
+- 默认协商上限 `--max 3200x1800`（可用 `--max 3840x2160` 开真 4K）；
+  切换：`./scripts/set-mode.sh 1920x1080@60`（编码器尺寸固定，需重启 wwcap）。
 
-独显路径（`./scripts/switch-gpu.sh nvidia`，`--capture sc --enc nvenc`）可做到 4K@60；
+独显路径（`./scripts/switch-gpu.sh nvidia`，`--capture sc --enc nvenc`）**4K 实测 57.3~57.6fps**；
 1080p 下打开 4:4:4 仍 55~60fps，码率约 +30~50%。
+
+> `--capture sc` 的 EGL 上下文现在按 DRM 节点选择，与抓帧卡同卡。
+> 早期版本硬编码「优先 NVIDIA」，在集显上会把 i915 的 Y-tiled dmabuf 导入 dGPU 的 EGL，
+> 报 `EGL_BAD_PARAMETER (0x300c)` 且一帧都不出。修复后集显跑 sc 可用（1080p 更快，4K 不提升）。
 
 ## 关键约束（实测得出，改动前务必阅读）
 
 1. **iGPU 被 Xorg 占用时无法启动 Hyprland**。DRM master 一张卡只能有一个；若 LXQt/Xorg 在跑，要么停掉它，要么按下面的方式让 Hyprland 用独显。
    当前部署：停 `sddm` + Sunshine，Hyprland 独占 `card1`(i915)。`sudo systemctl start sddm` 可随时回滚。
 2. **SSH 会话没有 seat，libseat 会拒绝 DRM 访问**。必须装 `seatd` 并启用（`systemctl enable --now seatd`），并以 `LIBSEAT_BACKEND=seatd` 启动。
-3. **HD 630 的 H.264 只有 `VAEntrypointEncSliceLP`（VDEnc）**，因此编码必须 `low_power=1`，且**只支持 CQP**，没有 CBR/VBR；自适应策略调节 QP 而非码率。
-4. **该驱动没有 VPP**（`vainfo` 无 `VAEntrypointVideoProc`），ARGB→NV12 只能 CPU 转换（`libswscale`）。4K 下这是主要 CPU 开销。
+3. **HD 630 的 H.264 只有 `VAEntrypointEncSliceLP`（VDEnc）**，因此编码必须 `low_power=1`，且**只支持 CQP**，没有 CBR/VBR；自适应策略调节 QP 而非码率。**目标码率只有 NVENC 能用**，集显上 `/capabilities` 返回 `rc:"cqp"`，前端滑块置灰。
+4. **该驱动没有 VPP**（`vainfo` 无 `VAEntrypointVideoProc`），`shm` 路径的 ARGB→NV12 只能 CPU 转换（`libswscale`）。4K 下这是主要 CPU 开销；改用 `--capture sc` 后转换在 GL shader 里做（conv 6.7ms → 0.3ms）。
 5. **HEVC 只有解码入口**，H.264 是唯一硬编格式；AV1 编码在 HD630/Pascal 上都不存在。
 6. **抓帧实际走 `wlr-screencopy` + `wl_shm`，不是 ext-image-copy-capture**。ext 协议的 dmabuf 在本机读出来是**全黑**（多种 modifier/同步方式都试过），而 screencopy 与 `grim` 同一路径、稳定正确。代价是每帧一次 GPU→CPU 回读（4K 约 2–4ms），可接受。
 7. **抓帧必须主动按帧率发起**，且主循环 `poll` 超时不能大于帧间隔（现为 4ms）。曾因 500ms 超时把 1080p 节流到 2fps。
@@ -207,11 +304,15 @@ bash scripts/restart-capture.sh --deep   # 等价于「强制恢复桌面」
 | 控制消息可打爆内存 | 网关未限制消息长度 | 上限 64KB |
 | 桌面纯黑、没有壁纸 | `hyprpaper 0.8.4` 在 headless 输出上报 `no target`，不绘制 | 改用 `swaybg -i ... -m fill` |
 | 4K 下 UI 极小、几乎看不清 | 4K 仍用 scale 1，逻辑分辨率也是 4K | 协商时按 DPR 设 scale（4K → 2x），逻辑仍 1920×1080 |
-| 出现两个鼠标 / 锁定后"没有光标" | screencopy 已把 compositor 光标编进视频帧，前端再画一支就重复 | 去掉前端自绘光标，直接看视频里的真实光标 |
+| 出现两个鼠标 / 锁定后"没有光标" | screencopy 已把 compositor 光标编进视频帧，前端再画一支就重复 | 曾经的做法是去掉前端自绘光标；**2026-11-20 起改成方案 B**：服务端用透明主题把光标从画面里去掉，再由前端自绘（见「本地光标」一节） |
 | 切换分辨率后画面冻结 | 编码器尺寸固定，重建判断基准用错 | 以「编码器实际尺寸」为准重建 + 强制 IDR |
 | 切 4:4:4 后前端仍显示 4:2:0 | 浏览器缓存旧 JS；且判断依赖"关键帧一定带 SPS" | SPS 严格解析 + 带 SPS 的 IDR 到达后重建解码器 |
 | 新桌面里鼠标位移减半、`hyprctl` 语法全变 | Hyprland 0.55 默认优先加载 `hyprland.lua`，没指定 `--config` 就用了 `/usr/share/hypr` 示例配置（HEADLESS scale 2） | 所有启动路径显式 `--config ~/.config/hypr/hyprland.conf` |
 | systemd 管理下出现两份 wwcap 抢 socket | `Restart=always` 自动拉起 + 脚本又手工起一份 | 重启/停止脚本检测到 systemd 后改走 `systemctl` |
+| 串流里鼠标"非常卡"、移动只有一半 | GPU 实测时 `pkill` 掉 Hyprland，`Restart=always` 立刻拉起的新实例拿不到 DRM master → **嵌套会话**，多出一个 `WAYLAND-1` 伪输出：画面被合成两遍（fps 58→30、cap 6→33ms），输入坐标系也变成两个输出的并集 | 停整条服务链 → `pkill -x Hyprland` 清干净 → 重启；`switch-gpu.sh` 已加守卫（检测到 active 先停服务）|
+| 追踪文件里一条指针事件都没有，报告说"数据不足" | 事件窗口按条数切（2000 条），而 `frm/dec/ren` 每帧 3 条 ≈ 只覆盖 12 秒；用户停手后指针事件被挤出窗口 | 改成按**时长**切（30 秒 / 上限 8000 条），报告优先选"指针样本最多的 snap 块" |
+| 追踪里输入的坐标全是 0 | `tr_input()` 把归一化坐标（0~1）按 `(int32_t)` 存进整型字段 | 字段改 `double`，落盘 `%.5f` |
+| `hyprctl setcursor ww-invisible` 执行成功但光标还在 | Hyprland 运行时不会重新加载 Xcursor 主题（红/透明主题对照实验证实），且 `enable_hyprcursor=1` 时只认 `.hlc` | 启动时给 `XCURSOR_THEME` + `cursor:enable_hyprcursor=false`，重启会话；验证用"指针两点各截一帧，差异像素应为 0" |
 
 ## 验收
 
@@ -229,8 +330,11 @@ node scripts/cdp-shot.mjs 9222 /tmp/live.png 8000
 
 - 4:4:4 仅 NVENC（独显）支持；Intel VAAPI 只有 4:2:0，开关会置灰并给出原因。4:4:4 码率约 +30~50%。
 - 参数自适应只覆盖 QP/目标帧率（三档策略）；丢包反馈的 QP 闭环尚未接上（`stats` 消息已上报，服务端未消费）。
-- 集显 shm 路径 4K 物理极限 ~17–23fps（无 VPP，CPU 转换）；4K60 需要独显 `--capture sc` 零拷贝路径。
-- 光标随视频帧下发（compositor 渲染进画面），前端不再自绘；真实光标位图/热点未单独接入。
+- 目标码率（CBR）只在支持 CBR 的编码器上生效（NVENC）；集显 VDEnc 只有 CQP，滑块置灰，实际码率随画面浮动。
+- 集显 4K 即使换成 `--capture sc`（GPU 转换 + PBO 回读）仍只有 20~22fps，`cap` 30~44ms：
+  限制在 Hyprland 的 4K 合成/服务 screencopy 节拍，**4K60 目前只有独显路径**。
+- 光标**不由视频下发**：服务端用全透明主题让合成器不画光标，前端自绘一个 SVG 箭头（延迟 0ms）。
+  代价是形状固定为箭头，文本 I 形/缩放箭头等不再区分；`WW_CURSOR=server` 可回退成"光标在视频里"。
 - 音频只做**下行**（整机混音）；浏览器麦克风上行（服务端 `ww-mic` 虚拟麦克风）与 waybar
   「远程麦克风使用中」指示属于二期，协议里已预留 `WW_IPC_AUDIO_UP` 与尾帧 `reserved` 字段。
 - 音频不做码率自适应：固定 64kbps，仅按客户端上报的丢包率开关 RED 冗余（>2% 开，<0.2% 关）。

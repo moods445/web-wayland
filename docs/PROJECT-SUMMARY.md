@@ -315,3 +315,62 @@ web (JS, 无构建)
 **约束（用户明确要求，2026-11-10，已写入项目根 `AGENTS.md`）**：禁止用 curl/Python 脚本批量抓取网页或调 API 抓数据；必须用浏览器自动化（agent-browser/playwright/chrome-use）；同时打开的网页不超过 4 个。本地 e2e/CDP 验证属于自动化测试，与此不冲突。
 
 **交接文档**：`/tmp/handoff-web-wayland.md`（临时目录，供新 agent 接手）。
+---
+
+## 11. 输入延迟与本地光标（2026-11-20 本轮）
+
+### 11.1 问题
+
+用户反馈"鼠标很卡"，且**无论分辨率、集显/独显都一样**。排查发现这不是吞吐问题：
+1080p 下服务端 58fps、`cap 7.5ms + conv 7.0ms`，输入注入 0.02ms，客户端解码 4ms、上屏 0.4ms。
+
+### 11.2 测量（两轮修正后才可信）
+
+新增常开追踪埋点：客户端 `web/src/trace.js`（输入/帧到达/解码/上屏时间戳 + 逐条
+`input→上屏` 延迟），服务端 `capture/src/main.c`（每条输入 `收到→注入`、每帧
+`id/pts/字节/发送时刻/光标坐标`），网关 `POST /trace-upload` 落盘 NDJSON，
+`scripts/trace-report.mjs` 出报告。详见 `docs/streaming-conclusions.md` 第 10 节。
+
+三个坑（都已修，详见 `docs/streaming-conclusions.md` 10.5 / 10.6）：
+
+1. 事件窗口按**条数**切（2000 条 ≈ 12 秒），指针事件被挤出窗口 → 报告误判"数据不足"或给出假好数字；
+2. 主指标"输入 → 首个上屏帧"只是**下界**，不证明帧里的光标动了；
+3. `tr_input()` 把归一化坐标按 `(int32_t)` 存进整型，落盘全是 0。
+
+最终指标是**光标可见延迟**：服务端每帧记录注入坐标，客户端记录指针轨迹，
+用**位置匹配**（不对钟）算"手到位 → 屏幕出现该位置"的毫秒数。
+
+### 11.3 结论数据
+
+| 测量 | 结果 |
+|---|---|
+| 光标可见延迟（Mac 客户端 1080p）| p50 26ms / p90 37ms / p99 45ms / max 52ms |
+| 13/64 次移动 | 2 秒内没有出现在画面上 |
+| 受控自测（180 点、450px/s、60Hz 注入）| **14.8% 的帧光标完全不动**；帧间隔 p50 16.9ms / p95 33.8ms |
+| 零拷贝 sc 路径对照 | 88fps 但 64.7% 帧无新位置（重复帧更多），并不更顺 |
+
+结论：**不是延迟太大，是光标在视频里 → 流畅度被抓帧节奏锁死**，而抓帧在 1080p 已贴着 16.6ms 预算。
+
+### 11.4 措施：本地光标（方案 B）
+
+- 服务端：`XCURSOR_THEME=ww-invisible` + `XCURSOR_SIZE=24`（`scripts/ww-session.service`）
+  且 `cursor:enable_hyprcursor = false`（`config/hypr/hyprland.conf`）→ 合成器不画光标。
+  **关键事实**：`hyprctl setcursor` 对 Xcursor 主题**运行时无效**（红/透明主题对照实验证实），
+  只有启动时通过环境变量才生效。验证手段：指针移到两个位置各截一帧，**差异像素 = 0**。
+- 客户端：`/capabilities` 返回 `{"cursor":"local"}` 后，canvas 设 `cursor:none`，
+  SVG 箭头 `#cursor-local` 用 `transform: translate3d()` 跟随真实指针，移出画布即隐藏。
+- 代价：光标形状只剩箭头（文本 I 形/缩放箭头/手形丢失）。
+- 回退：`WW_CURSOR=server` + 去掉 `XCURSOR_THEME`/`XCURSOR_SIZE`、`enable_hyprcursor` 改回 `true`，重启会话。
+
+### 11.5 相关文件
+
+`web/src/trace.js`（新增）、`scripts/trace-report.mjs`（新增）、`web/src/input.js`（`onPointer` 钩子）、
+`web/src/main.js`（本地光标 + 追踪接线 + `?ds=0` 开关）、`web/index.html` / `web/styles/main.css`、
+`capture/src/main.c`（追踪埋点 + `caps.cursor`）、`gateway/src/main.rs`（`/trace`、`/trace-upload`）、
+`config/hypr/hyprland.conf`、`scripts/ww-session.service`、`~/.icons/ww-invisible`。
+
+### 11.6 已知遗留
+
+- 本地光标固定箭头、不随 DPR 缩放（4K Retina 上可能偏小，按需调整 CSS 尺寸即可）；
+- 追踪落盘在 `/tmp`（tmpfs，占用即内存），上限约 8MB，历史保留 5~9 分钟；
+- `?ds=0` 开关只是给 canvas `desynchronized` 做 A/B，默认仍开启。

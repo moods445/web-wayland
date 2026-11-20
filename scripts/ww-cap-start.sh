@@ -37,6 +37,10 @@ fi
 [ -n "$OUT" ] || { echo "[cap] 无法创建 headless 输出" >&2; exit 1; }
 hyprctl keyword monitor "$OUT,1920x1080@60,0x0,1" >/dev/null 2>&1 || true
 
+# 零拷贝抓帧必须和 Hyprland 用同一张卡：集显写 card1，独显写 card0
+GBM_ARG=()
+[ -n "${WW_GBM:-}" ] && GBM_ARG=(--gbm "$WW_GBM")
+
 exec "$ROOT/capture/build/wwcap" \
     --video "$XDG_RUNTIME_DIR/ww-video.sock" \
     --ctrl "$XDG_RUNTIME_DIR/wwcap-ctrl.sock" \
@@ -46,4 +50,6 @@ exec "$ROOT/capture/build/wwcap" \
     --output "$OUT" \
     --max "${WW_MAX:-3200x1800}" \
     --fps "${WW_FPS:-60}" \
-    --qp "${WW_QP:-20}"
+    --qp "${WW_QP:-20}" \
+    --bitrate "${WW_BITRATE:-0}" \
+    "${GBM_ARG[@]}"

@@ -3,6 +3,30 @@ import { Transport } from './transport.js';
 import { Decoder, codecFromAnnexB } from './decoder.js';
 import { AudioPlayer } from './audio.js';
 import { Input } from './input.js';
+import { Trace, TraceUploader } from './trace.js';
+
+/* 输入/画面追踪：常开、纯内存，导出时可回放分析「鼠标为什么卡」 */
+const trace = new Trace();
+
+/* 追踪自动上传：定时 + 延迟突刺时把最近窗口 POST 给网关，用户无需手动导出。
+   meta() 在每次上传时才取值，所以可以引用后面才声明的模块变量。 */
+const traceUp = new TraceUploader(trace, {
+  meta: () => ({
+    resolution,
+    strategy: Number(pref.strategy),
+    fps: pref.fps,
+    enc: pref.enc,
+    bitrate: pref.bitrate,
+    chroma: pref.chroma,
+    status: {
+      e2eMs: Number((e2e || 0).toFixed(1)),
+      queue: decoder?.queue ?? 0,
+      rttMs: rtts.length ? Number((rtts.reduce((a, b) => a + b, 0) / rtts.length).toFixed(1)) : null,
+      decodeMs: decoder?.decodeMs == null ? null : Number(decoder.decodeMs.toFixed(2)),
+      renderMs: renderStats.n ? Number((renderStats.sum / renderStats.n).toFixed(2)) : null,
+    },
+  }),
+});
 
 const $ = (id) => document.getElementById(id);
 
@@ -11,11 +35,17 @@ const ui = {
   hud: $('hud'),
   enter: $('enter'), enterFs: $('enter-fs'), steps: $('steps'), errors: $('errors'),
   addr: $('server-addr'), copy: $('copy-addr'),
-  bitrate: $('hud-bitrate'), fps: $('hud-fps'), res: $('hud-res'),
+  bitrate: $('hud-bitrate'), bitrateTarget: $('hud-bitrate-target'),
+  fps: $('hud-fps'), res: $('hud-res'),
   latency: $('hud-latency'), tier: $('hud-tier'),
-  gear: $('gear'), settings: $('settings'), setRes: $('set-res'), setFps: $('set-fps'), setEnc: $('set-enc'),
+  cursor: $('cursor-local'),
+  gear: $('gear'), settings: $('settings'), setRes: $('set-res'), setResNote: $('set-res-note'),
+  setFps: $('set-fps'), setEnc: $('set-enc'),
   setFit: $('set-fit'), setHud: $('set-hud'), setClose: $('set-close'), setNote: $('set-note'),
-  setQp: $('set-qp'), setQpOut: $('set-qp-out'), setMode: $('set-mode'), setDecode: $('set-decode'),
+  setQp: $('set-qp'), setQpOut: $('set-qp-out'), setQpRow: $('set-qp-row'),
+  setBitrate: $('set-bitrate'), setBitrateOut: $('set-bitrate-out'),
+  setBitrateNote: $('set-bitrate-note'), setBitrateRow: $('set-bitrate-row'),
+  setMode: $('set-mode'), setDecode: $('set-decode'),
   setStrategy: $('set-strategy'), setStrategyOut: $('set-strategy-out'), setStrategyNote: $('set-strategy-note'),
   setChroma: $('set-chroma'), setChromaNote: $('set-chroma-note'),
   setChromaRow: $('set-chroma-row'), setChromaHint: $('set-chroma-hint'),
@@ -23,6 +53,7 @@ const ui = {
   setVol: $('set-vol'), setVolOut: $('set-vol-out'),
   setMuteHost: $('set-mute-host'), setMuteBlur: $('set-mute-blur'), setAudioState: $('set-audio-state'),
   btnRestart: $('btn-restart'), btnRestartDeep: $('btn-restart-deep'), setRestartNote: $('set-restart-note'),
+  btnTrace: $('btn-trace'), btnTraceReset: $('btn-trace-reset'), setTraceOut: $('set-trace-out'),
   setStats: $('set-stats'), stats: $('stats'),
   setHelp: $('set-help'), help: $('help'), helpClose: $('help-close'),
   report: $('report'), reportList: $('report-list'), reportClose: $('report-close'),
@@ -33,8 +64,9 @@ const ui = {
    手动选分辨率会带 lock=1，关闭服务端的自动升降档，避免和用户选择打架。
    画质滑块本质是 QP：本机 H.264 只有 CQP，没有真正的码率控制。 */
 const pref = Object.assign({ res: 'auto', fps: 0, hud: true, enc: '', fit: 'fill',
-  /* strategy: 0 平衡 1 流畅 2 画质 3 自定义（手动 QP）；chroma: 4:4:4 偏好 */
-  qp: 20, strategy: 0, chroma: false, decode: 'auto', mode: 'window', quality: true, stats: false,
+  /* strategy: 0 平衡 1 流畅 2 画质 3 自定义（手动 QP）；chroma: 4:4:4 偏好
+     bitrate: 目标码率（Mbps），0 = 关闭、按 QP 编码。只有支持 CBR 的编码器（NVENC）生效 */
+  qp: 20, strategy: 0, bitrate: 0, chroma: false, decode: 'auto', mode: 'window', quality: true, stats: false,
   /* 音频：vol 只作用于本机播放；muteHost 是「静音目标机扬声器」；muteBlur 失焦静音 */
   vol: 100, muteHost: false, muteBlur: false },
   JSON.parse(localStorage.getItem('ww.pref') || '{}'));
@@ -80,6 +112,7 @@ function codecLabel(codec) {
 function buildStats() {
   const defs = [
     ['stream', 'Video stream', true],
+    ['bitrate', 'Video bitrate (actual / target)'],
     ['in', 'Incoming frame rate from network'],
     ['dec', 'Decoding frame rate'],
     ['ren', 'Rendering frame rate'],
@@ -90,6 +123,7 @@ function buildStats() {
     ['decodeMs', 'Average decoding time'],
     ['queueMs', 'Average frame queue delay'],
     ['renderMs', 'Average rendering time'],
+    ['inputLag', 'Input → screen latency p50 / p95 / max'],
   ];
   const head = document.createElement('div');
   head.className = 'stats-title';
@@ -153,6 +187,7 @@ function updateStats() {
   rate.rendered = rendered;
 
   set('stream', `${resolution} ${rate.renFps.toFixed(2)} FPS (Codec: ${codecName} · ${chromaName})`);
+  set('bitrate', `${lastMbps.toFixed(1)} Mbps / 目标 ${targetBitrateLabel()}`);
   set('in', `${rate.inFps.toFixed(2)} FPS`);
   set('dec', `${rate.decFps.toFixed(2)} FPS`);
   set('ren', `${rate.renFps.toFixed(2)} FPS`);
@@ -182,6 +217,13 @@ function updateStats() {
   set('decodeMs', dm == null ? '-' : `${dm.toFixed(2)} ms`);
   set('queueMs', qm == null ? '-' : `${qm.toFixed(2)} ms`);
   set('renderMs', renderStats.n ? `${(renderStats.sum / renderStats.n).toFixed(2)} ms` : '-');
+  {
+    const l = trace.stats();
+    const g = l.inputLag;
+    set('inputLag', g
+      ? `${g.p50} / ${g.p95} / ${g.max} ms  (n=${g.n}, 帧间隔>50ms ${l.frameGapsOver50ms} 次)`
+      : '-');
+  }
 
   /* 应用层 RTT：网关直接回 pong，不打扰 wwcap */
   if (transport && !transport.closed) transport.send({ t: 'ping', ts: now });
@@ -248,13 +290,152 @@ function requestQp(v) {
   transport?.send({ t: 'qp', v: Number(v) });
 }
 
+function requestBitrate(mbps) {
+  transport?.send({ t: 'bitrate', v: Math.round(Number(mbps) * 1e6) });
+}
+
+/* 画质滑块只表示 QP；实际码率统一的统计信息里看，避免两处数字含义不同 */
 function renderQp() {
-  const mbps = lastMbps ? `${lastMbps.toFixed(1)} Mbps` : '— Mbps';
-  ui.setQpOut.textContent = `QP ${pref.qp} · ${mbps}`;
+  ui.setQpOut.textContent = `QP ${pref.qp}`;
+}
+
+/* 目标码率：仅支持 CBR 的编码器（NVENC）可设；不支持时置灰并说明原因 */
+function renderBitrate() {
+  const cbr = caps.rc === 'cbr';
+  const v = Math.max(0, Math.min(80, Number(pref.bitrate) || 0));
+  ui.setBitrate.value = String(cbr ? v : 0);
+  ui.setBitrate.disabled = !cbr;
+  if (cbr) {
+    ui.setBitrateOut.textContent = v > 0 ? `${v} Mbps` : '关闭（QP 控制）';
+    ui.setBitrateNote.textContent = v > 0
+      ? `按 ${v} Mbps 恒定输出（CBR）：静态画面用填充占满，实时值见统计信息。`
+      : '0 = 关闭，按画质（QP）编码；拖到右侧按目标码率恒定输出。';
+  } else {
+    ui.setBitrateOut.textContent = capsLoaded ? '不可用（仅 CQP）' : '读取中…';
+    ui.setBitrateNote.textContent = capsLoaded
+      ? '当前编码器只支持 CQP，码率随画面复杂度浮动；切到独显 NVENC 后可按目标码率编码。'
+      : '正在读取编码器能力…';
+  }
+  ui.setBitrateRow.classList.toggle('muted', !cbr);
+  /* 目标码率生效时 QP 不参与码控，置灰画质滑块避免“拖了没反应” */
+  const qpLocked = cbr && v > 0;
+  ui.setQp.disabled = qpLocked;
+  ui.setQpRow.classList.toggle('muted', qpLocked);
+}
+
+/* 分辨率过高警示：集显（非 nvenc）下 3200/4K 实测只有 20~30fps，
+   而且客户端解码 4K 也会吃掉上百毫秒，表现为"鼠标几乎用不了"。 */
+function renderResNote() {
+  const note = ui.setResNote;
+  if (!note) return;
+  const v = ui.setRes.value;
+  const high = v === '3200x1800' || v === '3840x2160';
+  const igpu = caps.encoder && caps.encoder !== 'nvenc';
+  if (high && igpu) {
+    note.textContent = `当前编码器是集显（${caps.encoder}），该分辨率实测只有 20~30fps、延迟上百毫秒，鼠标会明显发卡；建议 1920 × 1080。`;
+    note.classList.remove('hidden');
+  } else {
+    note.textContent = '';
+    note.classList.add('hidden');
+  }
+}
+
+/* ── 本地光标 ─────────────────────────────────────────────────
+ * 服务端用全透明光标主题后，画面里不再有光标（/capabilities 回报 cursor=local），
+ * 这里自己画一个：位置直接取系统指针的 clientX/clientY，不走视频链路，
+ * 所以延迟是 0，也不受帧率/丢帧影响。光标形状固定为箭头（代价已知）。 */
+let localCursor = false;
+
+function enableLocalCursor(on) {
+  localCursor = !!on;
+  if (ui.canvas) ui.canvas.style.cursor = on ? 'none' : '';
+  if (!on && ui.cursor) ui.cursor.classList.add('hidden');
+}
+
+function placeLocalCursor(clientX, clientY) {
+  if (!localCursor || !ui.cursor) return;
+  if (clientX == null) {          // 指针离开画布 → 藏起来，交还给系统光标
+    ui.cursor.classList.add('hidden');
+    return;
+  }
+  ui.cursor.style.transform = `translate3d(${clientX}px, ${clientY}px, 0)`;
+  ui.cursor.classList.remove('hidden');
+}
+
+/* 指针离开窗口时本地光标要一起藏掉，否则会停在边缘 */
+document.addEventListener('pointerleave', () => {
+  if (localCursor && ui.cursor) ui.cursor.classList.add('hidden');
+});
+
+/* 统计面板/叠层里显示的“设置码率”：区分「没设」与「编码器不支持」 */
+function targetBitrateLabel() {
+  if (caps.rc !== 'cbr') return '不可用（仅 CQP）';
+  return pref.bitrate > 0 ? `${pref.bitrate} Mbps` : '关闭（QP 控制）';
+}
+
+/* ── 输入追踪导出 ─────────────────────────────────────────────
+ * 客户端常开记录（trace.js），服务端每 5 秒把「收到→注入」耗时写进
+ * /tmp/wwcap-trace.json 并由网关 /trace 暴露；导出时两份合并成一个文件，
+ * 交给 scripts/trace-report.mjs 出报告。 */
+async function collectTrace() {
+  transport?.send({ t: 'trace', v: 1 });      // 让 wwcap 立刻落盘一次
+  await new Promise((r) => setTimeout(r, 250));
+  let server = null;
+  try {
+    const r = await fetch('/trace', { cache: 'no-store' });
+    if (r.ok) {
+      /* 服务端也是 NDJSON：逐行解析成 inputs / frames */
+      const inputs = [];
+      const frames = [];
+      for (const line of (await r.text()).split('\n')) {
+        if (!line) continue;
+        try {
+          const o = JSON.parse(line);
+          if (o.type === 'in') inputs.push(o);
+          else if (o.type === 'frm') frames.push(o);
+        } catch { /* 跳过被轮转截断的残行 */ }
+      }
+      server = { v: 1, side: 'server', inputs, frames };
+    }
+  } catch { /* 服务端没就绪不影响客户端部分 */ }
+  return {
+    v: 1,
+    takenAt: new Date().toISOString(),
+    client: trace.dump({
+      resolution, strategy: pref.strategy, fps: pref.fps,
+      enc: pref.enc, chroma: pref.chroma, bitrate: pref.bitrate,
+      status: window.__ww?.status?.(),
+    }),
+    server,
+  };
+}
+
+function downloadJson(obj, name) {
+  const blob = new Blob([JSON.stringify(obj)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+async function exportTrace() {
+  if (ui.setTraceOut) ui.setTraceOut.textContent = '正在收集…';
+  const data = await collectTrace();
+  downloadJson(data, `ww-trace-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+  const lag = data.client.stats.inputLag;
+  if (ui.setTraceOut) {
+    ui.setTraceOut.textContent = lag
+      ? `已导出 p50 ${lag.p50} / p95 ${lag.p95} ms`
+      : '已导出（还没有指针操作）';
+  }
+  return data;
 }
 
 /* ── 串流策略与 4:4:4 能力 ────────────────────────────────────── */
-let caps = { chroma444: false, encoder: '' };
+/* rc: "cbr" = 可按目标码率编码，"cqp" = 码率随画面浮动（集显） */
+/* cursor: "local" = 服务端已隐藏合成器光标，客户端自己画；"server" = 光标在视频里 */
+let caps = { chroma444: false, encoder: '', rc: 'cqp', cursor: 'server' };
 let capsLoaded = false;   // 拿到服务端能力前先乐观放行，避免误置灰
 let decode444 = null;     // 浏览器能否解 H.264 High 4:4:4
 
@@ -285,6 +466,10 @@ async function refreshCaps() {
     }
   } catch { /* 网关未提供 /capabilities 时保持乐观 */ }
   renderChroma();
+  renderBitrate();
+  renderResNote();
+  /* 服务端隐藏了光标才启用本地光标，否则会双光标 */
+  enableLocalCursor(caps.cursor === 'local');
 }
 
 function renderStrategy() {
@@ -386,7 +571,12 @@ dbgEl.style.cssText = 'position:fixed;left:12px;bottom:10px;z-index:40;font:11px
 dbgEl.textContent = 'boot';
 if (DEBUG) ui.stage.appendChild(dbgEl);
 
-const ctx = ui.canvas.getContext('2d', { alpha: false, desynchronized: true });
+/* desynchronized（低延迟直通）绕过合成器直接上屏，理论上省一帧；
+   但在 macOS 上它可能脱离 vsync，表现为"帧率够但画面一顿一顿"。
+   用 ?ds=0 可关掉做 A/B（上下文属性是创建时固定的，所以只能靠 URL 切换）。 */
+const DESYNC = !new URLSearchParams(location.search).has('ds') ||
+  new URLSearchParams(location.search).get('ds') !== '0';
+const ctx = ui.canvas.getContext('2d', { alpha: false, desynchronized: DESYNC });
 let transport = null, decoder = null, input = null, audio = null;
 let rendered = 0, lastHudAt = 0, lastRenderedTs = 0, e2e = 0, resolution = '—', chunkLogged = false;
 let lastMbps = 0;          // 上一秒实测码率，画质滑块旁展示
@@ -422,6 +612,7 @@ try {
 } catch { /* 忽略旧浏览器 */ }
 
 function onFrame(frame) {
+  trace.decoded(performance.now(), frame.timestamp);
   if (rendered === 0) console.log('ww: first decoded frame', frame.displayWidth, frame.displayHeight);
 
   /* 分辨率变化后 SPS 变了，必须重建解码器，否则会静默停帧 */
@@ -440,8 +631,11 @@ function onFrame(frame) {
   }
   const drawAt = performance.now();
   ctx.drawImage(frame, 0, 0, ui.canvas.width, ui.canvas.height);
-  renderStats.sum += performance.now() - drawAt;
+  const drawMs = performance.now() - drawAt;
+  renderStats.sum += drawMs;
   renderStats.n++;
+  /* 上屏时刻 = 输入的"可见反馈"锚点，用于算 input→画面 的延迟 */
+  trace.rendered(drawAt + drawMs, frame.timestamp);
 
   // 端到端估算：从数据到达浏览器到本帧上屏（服务端时钟不可跨机比较）
   if (lastArrival && rendered > 2) {
@@ -516,10 +710,20 @@ function startHudLoop() {
         abuf: Math.round(as.bufferMs || 0),
       });
     }
+    /* 自动上传状态：让"有没有在传"随时可见，不用等手动导出 */
+    if (ui.setTraceOut) {
+      const up = traceUp.stat();
+      const lagStat = trace.stats().inputLag;
+      ui.setTraceOut.textContent = up.sent
+        ? `自动上传 ${up.sent} 份${up.failures ? ` · 失败 ${up.failures}` : ''}${lagStat ? ` · p95 ${lagStat.p95}ms` : ''}`
+        : (up.lastError ? `上传失败：${up.lastError}` : '等待首次上传…');
+    }
+
     if (!hudVisible()) return;
 
     ui.fps.textContent = `${fpsWindow.length} fps`;
     ui.bitrate.textContent = `${(bytesThisTick * 8 / 1e6).toFixed(1)} Mbps`;
+    ui.bitrateTarget.textContent = targetBitrateLabel();
     ui.res.textContent = resolution;
     ui.latency.textContent = `${e2e.toFixed(0)} ms`;
 
@@ -568,6 +772,9 @@ let resetting = false;
 function resetSession(msg) {
   if (resetting) return;
   resetting = true;
+  /* 断开前把最后一段追踪送出去（fetch 用 keepalive，页面不关也能落地） */
+  traceUp.stop();
+  enableLocalCursor(false);   // 断开后交还给系统光标
   const dropped = decoder?.dropped ?? 0;
   const skipped = decoder?.skipped ?? 0;
   if (pref.quality && rendered > 0 && session.t0) {
@@ -672,6 +879,7 @@ async function enter(fullscreen) {
     transport = new Transport(`https://${host}:${port}/stream`, {
       onChunk: (c) => {
         lastArrival = performance.now();
+        trace.frame({ id: c.frameId, pts: c.ptsUs, t: c.arrivedAt, key: c.key, bytes: c.data.length });
         const useCodec = (codec) => {
           codecName = codecLabel(codec);
           /* profile 244 = H.264 High 4:4:4 Predictive，其余按 4:2:0 显示 */
@@ -738,7 +946,24 @@ async function enter(fullscreen) {
 
     /* 自动协商：物理像素做输出，scale 用 DPR（2x UI），逻辑尺寸与浏览器 CSS 尺寸一致 */
     setTimeout(() => {
-      if (pref.res !== 'auto') requestRes(pref.res);
+      if (pref.res !== 'auto') {
+        /* 集显上 3200/4K 实测只有 20~30fps、抓帧 55ms、客户端解码上百毫秒，
+           连上去就是"鼠标几乎用不了"。连接时临时降到 1080p，
+           但**不改**用户保存的偏好（切到独显后仍然按原值生效）。 */
+        const highRes = pref.res === '3200x1800' || pref.res === '3840x2160';
+        if (highRes && caps.encoder && caps.encoder !== 'nvenc') {
+          ui.setRes.value = '1920x1080';
+          if (ui.setResNote) {
+            ui.setResNote.textContent =
+              `集显下 ${pref.res} 只有 20~30fps，本次会话已临时降到 1920×1080（保存的设置未改）。`;
+            ui.setResNote.classList.remove('hidden');
+          }
+          console.warn('ww: 集显下', pref.res, '过慢，本次会话改用 1920x1080');
+          requestRes('1920x1080');
+        } else {
+          requestRes(pref.res);
+        }
+      }
       else autoMode();
       /* 始终下发帧率：pref.fps=0（自动）要显式发 0 把服务端恢复到默认值，
          否则上一个会话设的 30fps 会一直留在 wwcap 里，鼠标看起来"不跟手" */
@@ -753,6 +978,8 @@ async function enter(fullscreen) {
         transport?.send({ t: 'strategy', v: Number(pref.strategy) || 0 });
       }
       transport?.send({ t: 'chroma', v: pref.chroma ? 1 : 0 });
+      /* 目标码率放在最后：策略/AI 档位会改 QP，码率设置要覆盖它 */
+      if (pref.bitrate > 0) requestBitrate(pref.bitrate);
       if (pref.enc) setTimeout(refreshCaps, 700);
     }, 500);
     let modeTimer = 0;
@@ -766,8 +993,11 @@ async function enter(fullscreen) {
     ui.stats.classList.toggle('hidden', !pref.stats);
     if (pref.stats) rate.t = 0;
 
-    input = new Input(ui.canvas, (m) => transport?.send(m), {
+    /* 每条出站输入先过 trace：补客户端时间戳 + 记账（不发则丢弃） */
+    input = new Input(ui.canvas, (m) => { if (transport && !transport.closed) transport.send(trace.input(m)); }, {
       onToggleStats: () => setStatsVisible(!pref.stats),
+      /* 本地光标跟随真实指针，每帧同步更新（不经 rAF 节流） */
+      onPointer: (cx, cy) => placeLocalCursor(cx, cy),
     });
 
     if (fullscreen || pref.mode === 'fullscreen') {
@@ -780,6 +1010,7 @@ async function enter(fullscreen) {
       }
     }
     startHudLoop();
+    traceUp.start();          // 连上就开始异步上传追踪窗口
   } catch (e) {
     /* 连接失败必须回收半成品 transport，否则下次点击被 `if (transport) return` 挡住，
        且 status().connected 会把未连上的对象误报成已连接 */
@@ -843,9 +1074,20 @@ window.__ww = {
     codec: activeCodec,
     decode444,
   }),
-  pointer: (x, y) => transport?.send({ t: 'pm', x, y }),
-  key: (k, down) => transport?.send({ t: 'kk', k, d: down ? 1 : 0 }),
+  /* 注入类消息也走 trace，保证自动化压测与真人操作产出同构的追踪数据 */
+  pointer: (x, y) => transport?.send(trace.input({ t: 'pm', x, y })),
+  key: (k, down) => transport?.send(trace.input({ t: 'kk', k, d: down ? 1 : 0 })),
   requestKeyframe: () => transport?.send({ t: 'kf' }),
+  trace: () => trace.dump({ resolution, strategy: pref.strategy, fps: pref.fps,
+                            enc: pref.enc, chroma: pref.chroma, status: window.__ww.status() }),
+  traceStats: () => trace.stats(),
+  /* 自动上传：最近一次统计 / 立刻推一份（自动化取数用） */
+  uploadStat: () => traceUp.stat(),
+  uploadNow: () => traceUp.flush('manual'),
+  /* 让 wwcap 立刻把环形缓冲落盘（导出/自动化取数前调用，避免等 5 秒周期） */
+  traceFlush: () => transport?.send({ t: 'trace', v: 1 }),
+  resetTrace: () => { trace.reset(); return trace.stats(); },
+  exportTrace: () => exportTrace(),
 };
 
 if (!('WebTransport' in window)) {
@@ -875,6 +1117,8 @@ ui.setMuteHost.checked = !!pref.muteHost;
 ui.setMuteBlur.checked = !!pref.muteBlur;
 renderQp();
 renderStrategy();
+renderBitrate();
+renderResNote();
 renderVol();
 probeDecode444().then(renderChroma);
 refreshCaps();
@@ -905,6 +1149,19 @@ ui.setStrategy.addEventListener('click', (e) => {
   console.log('ww: 策略 ->', STRATEGY_LABEL[s]);
 });
 
+/* 目标码率：拖动只更新显示，松手才下发（避免刷爆控制流）。
+   0 = 关闭，服务端重建回 CQP 并按当前 QP 编码。 */
+ui.setBitrate.addEventListener('input', () => {
+  pref.bitrate = Number(ui.setBitrate.value) || 0;
+  renderBitrate();
+});
+ui.setBitrate.addEventListener('change', () => {
+  savePref();
+  requestBitrate(pref.bitrate);
+  renderBitrate();
+  console.log('ww: 目标码率 ->', pref.bitrate > 0 ? `${pref.bitrate} Mbps` : '关闭（QP）');
+});
+
 ui.setChroma.addEventListener('change', () => {
   pref.chroma = ui.setChroma.checked;
   savePref();
@@ -921,6 +1178,7 @@ ui.setRes.addEventListener('change', () => {
   pref.res = ui.setRes.value;
   savePref();
   requestRes(pref.res);
+  renderResNote();
 });
 ui.setFit.addEventListener('change', () => {
   pref.fit = ui.setFit.value;
@@ -1092,6 +1350,13 @@ function requestRestart(deep) {
 /* 串流控制按钮：重启采集 / 强制恢复桌面 */
 ui.btnRestart.addEventListener('click', () => requestRestart(false));
 ui.btnRestartDeep.addEventListener('click', () => requestRestart(true));
+
+/* 输入追踪：导出（客户端+服务端合并）/ 清空重录 */
+ui.btnTrace?.addEventListener('click', () => { exportTrace().catch((e) => console.error('trace', e)); });
+ui.btnTraceReset?.addEventListener('click', () => {
+  trace.reset();
+  if (ui.setTraceOut) ui.setTraceOut.textContent = '已清空，开始记录';
+});
 
 ui.setHelp.addEventListener('click', () => setHelpVisible(true));
 ui.helpClose.addEventListener('click', () => setHelpVisible(false));

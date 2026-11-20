@@ -22,6 +22,13 @@ struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
 /* chroma444=true 时使用 yuv444p（H.264 High 4:4:4 Predictive，仅 NVENC 支持） */
 struct ww_enc *ww_enc_create_chroma(const char *kind, const char *drm_node,
                                     int w, int h, int fps, int qp, bool chroma444);
+/* bitrate_bps>0 且编码器支持 CBR 时按目标码率编码（此时 qp 不参与），
+   否则回退纯 CQP（码率随画面浮动，由 ww_enc_is_cbr 告知实际模式） */
+struct ww_enc *ww_enc_create_full(const char *kind, const char *drm_node,
+                                  int w, int h, int fps, int qp, bool chroma444,
+                                  int64_t bitrate_bps);
+/* 该编码器能否按目标码率（CBR）编码；集显 VDEnc 实测只有 CQP */
+bool ww_enc_probe_cbr(const char *kind, const char *drm_node);
 /* 探测该编码器能否实际打开 4:4:4（VAAPI 恒为 false） */
 bool ww_enc_probe_444(const char *kind, const char *drm_node);
 struct ww_enc *ww_enc_create(const char *drm_node, int w, int h, int fps, int qp);
@@ -43,8 +50,13 @@ int ww_enc_submit_nv12(struct ww_enc *e, const uint8_t *y, int ys,
 /* 取出一个已编码的访问单元，返回 1 表示有输出，0 表示暂无 */
 int ww_enc_receive(struct ww_enc *e, struct ww_nal_out *out);
 
-/* 运行时改 QP（自适应控制器用），立即生效 */
+/* 运行时改 QP（自适应控制器用），立即生效；CBR 模式下返回 0 且不生效 */
 int ww_enc_set_qp(struct ww_enc *e, int qp);
+
+/* 运行时改目标码率（bps），返回实际生效的码率；0 表示该编码器只支持 CQP */
+int64_t ww_enc_set_bitrate(struct ww_enc *e, int64_t bps);
+/* true = 当前按目标码率（CBR）编码；false = 按 QP（CQP），码率随画面浮动 */
+bool ww_enc_is_cbr(struct ww_enc *e);
 
 /* 取走内部分段耗时（毫秒，调用后清零），用于定位瓶颈 */
 void ww_enc_take_stats(struct ww_enc *e, double *conv_ms, double *up_ms, double *send_ms);

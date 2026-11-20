@@ -19,13 +19,16 @@ const KEYMAP = {
 const BTN = { 0: 272, 1: 274, 2: 273 }; // left / middle / right (Linux BTN_*)
 
 export class Input {
-  /* 不要在这里画自绘光标：wwcap 的 screencopy 已经把 compositor 光标
-     一起编进视频帧（Hyprland 会忽略 overlay_cursor=0），本地再画一支
-     就是屏幕上同时出现两个鼠标。这里只负责把事件转成注入消息。 */
-  constructor(canvas, send, { onToggleStats }) {
+  /* 光标绘制不在这里：本类只负责把事件转成注入消息。
+     光标由 main.js 的 #cursor-local 绘制，前提是服务端已用透明光标主题把
+     compositor 光标从画面里去掉（/capabilities 的 cursor:"local"）。
+     两边只允许有一支光标，否则会同时出现两个鼠标。 */
+  constructor(canvas, send, { onToggleStats, onPointer } = {}) {
     this.canvas = canvas;
     this.send = send;
     this.onToggleStats = onToggleStats;
+    /* onPointer(clientX, clientY, nx, ny)：本地光标用，必须每帧同步、不走 rAF 节流 */
+    this.onPointer = onPointer;
     this.locked = false;
     this.rafPending = false;
     this.rect = null;
@@ -57,6 +60,7 @@ export class Input {
     if (x < 0 || x > 1 || y < 0 || y > 1) return false;
     this.absX = x;
     this.absY = y;
+    this.onPointer?.(e.clientX, e.clientY, x, y);
     return true;
   }
 
@@ -150,6 +154,8 @@ export class Input {
         return;
       }
       if (this.#setAbs(e)) this.#schedule();
+      /* 离开画布（信箱边、HUD、设置面板）时通知上层把本地光标藏掉 */
+      else this.onPointer?.(null);
     });
 
     on(c, 'mousedown', (e) => {

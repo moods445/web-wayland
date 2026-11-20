@@ -40,6 +40,16 @@ case "$GPU" in
         echo "用法: $0 {intel|nvidia}" >&2; exit 1 ;;
 esac
 
+# systemd 常驻时不能只 pkill：`ww-session` 是 Restart=always，会立刻拉起一个新的
+# Hyprland，而这个新实例拿不到 DRM master，会退化成**嵌套**会话（多出一个
+# WAYLAND-1 伪输出）。后果是每个画面被合成两遍（fps 58→30、输入延迟翻倍），
+# 且输入坐标系变成两个输出的并集，鼠标移动只有一半位移——表现为「鼠标非常卡」。
+if systemctl --user is-active --quiet ww-session 2>/dev/null; then
+    log "检测到 systemd 常驻，先停整条服务链（避免双 Hyprland 嵌套）"
+    systemctl --user stop ww-cap ww-gateway ww-session 2>/dev/null || true
+    sleep 3
+fi
+
 log "停止现有会话"
 pkill -f 'wwcap --video' 2>/dev/null || true
 pkill -f start-hyprland 2>/dev/null || true

@@ -11,6 +11,9 @@
   <div id="stage" class="hidden">
     <canvas id="screen"></canvas>
 
+    <!-- 本地光标：服务端用透明主题后画面里没有光标，这里自己画一个（延迟 0ms） -->
+    <div id="cursor-local" class="cursor-local hidden" aria-hidden="true"></div>
+
     <!-- 客户端串流设置（只影响本机这条连接，不改远端桌面配置） -->
     <button id="gear" class="gear" title="串流设置">&#9881;</button>
     <div id="settings" class="settings hidden">
@@ -42,6 +45,7 @@
             <option value="3840x2160">3840 × 2160（4K）</option>
           </select>
         </label>
+        <small id="set-res-note" class="set-res-warn hidden"></small>
 
         <label class="settings-row">
           <span>帧率</span>
@@ -53,13 +57,22 @@
           </select>
         </label>
 
-        <label class="settings-row col">
+        <label class="settings-row col" id="set-qp-row">
           <span class="row-head">
             <span>画质</span>
-            <output id="set-qp-out">QP 20 · — Mbps</output>
+            <output id="set-qp-out">QP 20</output>
           </span>
           <input type="range" id="set-qp" min="0" max="100" step="1" aria-label="画质">
-          <small>向右更清晰。本机仅支持 CQP，码率随画面复杂度浮动。</small>
+          <small>向右更清晰。设置目标码率后由码率接管，此项置灰。</small>
+        </label>
+
+        <label class="settings-row col" id="set-bitrate-row">
+          <span class="row-head">
+            <span>码率</span>
+            <output id="set-bitrate-out">关闭（QP 控制）</output>
+          </span>
+          <input type="range" id="set-bitrate" min="0" max="80" step="5" aria-label="目标码率">
+          <small id="set-bitrate-note">0 = 关闭，按画质（QP）编码；拖到右侧按目标码率恒定输出。</small>
         </label>
       </section>
 
@@ -175,6 +188,18 @@
           </span>
           <small>「重启采集」重建抓帧与编码，桌面里的程序都会保留；仍不出图再用「强制恢复桌面」，它会重启整个桌面会话（窗口会关闭，需刷新页面重连）。</small>
         </label>
+
+        <label class="settings-row col">
+          <span class="row-head">
+            <span>输入追踪</span>
+            <output id="set-trace-out">—</output>
+          </span>
+          <span class="settings-btns">
+            <button id="btn-trace" class="mini" type="button">导出追踪</button>
+            <button id="btn-trace-reset" class="mini" type="button">清空重录</button>
+          </span>
+          <small>常开记录输入与画面的时间戳（输入发出 → 帧到达 → 上屏）。每 15 秒<b>自动上传到服务器</b>，出现卡顿会立刻补传一份，无需手动导出。服务端以 JSONL 逐行追加（可直接 tail -f），单文件 2MB 自动轮转，客户端+服务端合计上限约 8MB。「导出追踪」仅在需要留档时用。</small>
+        </label>
       </section>
 
       <div class="settings-actions">
@@ -216,6 +241,7 @@
           <h4>统计信息字段</h4>
           <dl class="help-list help-stats">
             <div><dt>Video stream</dt><dd>当前分辨率、渲染帧率与解码格式</dd></div>
+            <div><dt>Video bitrate</dt><dd>实际下行码率 / 设置里指定的目标码率；仅 CQP 时为“不可用”</dd></div>
             <div><dt>Incoming frame rate from network</dt><dd>每秒从网络收齐并交给解码器的帧数</dd></div>
             <div><dt>Decoding / Rendering frame rate</dt><dd>解码输出帧率与实际绘制上屏帧率</dd></div>
             <div><dt>Host processing latency</dt><dd>服务端采集 + 编码耗时；协议暂无该时间戳，显示 -</dd></div>
@@ -232,7 +258,8 @@
     <div id="hud" class="hud hidden">
       <div class="hud-title">串流状态</div>
       <dl>
-        <div><dt>码率</dt><dd id="hud-bitrate">—</dd></div>
+        <div><dt>设置码率</dt><dd id="hud-bitrate-target">—</dd></div>
+        <div><dt>实际码率</dt><dd id="hud-bitrate">—</dd></div>
         <div><dt>帧率</dt><dd id="hud-fps">—</dd></div>
         <div><dt>分辨率</dt><dd id="hud-res">—</dd></div>
         <div><dt>端到端</dt><dd id="hud-latency">—</dd></div>

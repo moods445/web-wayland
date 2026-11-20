@@ -11,6 +11,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /* 供 /healthz 与自动化测试断言的全局计数 */
 static DATAGRAMS_IN: AtomicU64 = AtomicU64::new(0);
@@ -22,6 +23,8 @@ static AUDIO_DROPPED: AtomicU64 = AtomicU64::new(0);
 static SESSIONS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+/* /trace-upload 限速用：最近一次真正落盘的时刻（ms），避免多标签页把磁盘刷爆 */
+static LAST_TRACE_UPLOAD_MS: AtomicU64 = AtomicU64::new(0);
 /* 当前拥有输入注入权的会话：多客户端时避免两个指针互相拽动光标。
    INPUT_OWNER 只是「当前操作者」，不是永久的：owner 超过 INPUT_LEASE_MS
    没有输入就把控制权让给别的会话，否则一个没断干净的旧会话（例如异常退出
@@ -119,6 +122,45 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/* 从首包缓冲区里取出 POST body：按 Content-Length 把剩余字节补齐。
+   浏览器用字符串 body 的 fetch 一定带 Content-Length，这里不处理 chunked。 */
+async fn read_request_body(
+    tls: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    head: &[u8],
+    max: usize,
+) -> Option<Vec<u8>> {
+    let text = String::from_utf8_lossy(head);
+    let mut len: Option<usize> = None;
+    for line in text.lines() {
+        if line.is_empty() {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
+            len = v.trim().parse().ok();
+        }
+    }
+    let cl = len?;
+    if cl > max {
+        return None;
+    }
+    let sep = head.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let mut body: Vec<u8> = head.get(sep..).unwrap_or(&[]).to_vec();
+    while body.len() < cl {
+        let mut tmp = vec![0u8; 64 * 1024];
+        match tls.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(k) => body.extend_from_slice(&tmp[..k]),
+            Err(_) => break,
+        }
+    }
+    if body.len() < cl {
+        return None;
+    }
+    body.truncate(cl);
+    Some(body)
+}
+
 /* ── HTTPS 静态托管 ─────────────────────────────────────────── */
 async fn serve_https(acceptor: TlsAcceptor, root: PathBuf) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", PORT)).await?;
@@ -162,6 +204,79 @@ async fn serve_https(acceptor: TlsAcceptor, root: PathBuf) -> Result<()> {
             // 剥掉查询串，否则 /?auto=1 会被当成文件名
             let raw = raw.split('?').next().unwrap_or("/");
 
+            /* 前端自动上传的输入追踪（POST，NDJSON body）。用户不需要手动导出：
+               每 15 秒一份滚动窗口，卡顿突刺时立刻补一份。
+               文件是**追加**的（不覆盖），所以可以 tail -f / 逐行 jq：
+                 * ww-client-trace.jsonl —— 一行一条记录（snap / ev / pair），
+                   超过 WW_TRACE_MAX_BYTES（默认 2MB）轮转成 .jsonl.1，只保留一份；
+                 * 服务端 wwcap-trace.jsonl —— 同样是追加行式，2MB 轮转。
+               总计 ≤ 4MB。另做了上传限速（网关 1.5 秒内只接受一份），
+               避免多标签页/异常重连把盘刷爆。 */
+            if raw == "/trace-upload" {
+                const MAX_BODY: usize = 1024 * 1024;   // 单份上限 1MB，正常约 150KB
+                let body = match read_request_body(&mut tls, &buf[..n], MAX_BODY).await {
+                    Some(b) if !b.is_empty() && b.iter().any(|c| !c.is_ascii_whitespace()) => b,
+                    _ => {
+                        let _ = tls
+                            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        let _ = tls.flush().await;
+                        return;
+                    }
+                };
+
+                /* 限速：1.5 秒内重复上传直接丢弃（204，不写盘） */
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let prev = LAST_TRACE_UPLOAD_MS.swap(now_ms, Ordering::Relaxed);
+                let too_soon = now_ms.saturating_sub(prev) < 1500;
+
+                let dir = std::env::var("WW_TRACE_DIR").unwrap_or_else(|_| "/tmp".to_string());
+                let hist_max: u64 = std::env::var("WW_TRACE_MAX_BYTES")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v >= 256 * 1024)
+                    .unwrap_or(2 * 1024 * 1024);
+                let hist = std::path::Path::new(&dir).join("ww-client-trace.jsonl");
+
+                let mut ok = true;
+                if !too_soon {
+                    /* 超限先轮转：只保留 .jsonl 与 .jsonl.1 两份 */
+                    if let Ok(md) = tokio::fs::metadata(&hist).await {
+                        if md.len() + body.len() as u64 > hist_max {
+                            let _ = tokio::fs::rename(&hist, hist.with_extension("jsonl.1")).await;
+                        }
+                    }
+                    if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&hist)
+                        .await
+                    {
+                        use tokio::io::AsyncWriteExt as _;
+                        ok = async {
+                            f.write_all(&body).await?;
+                            if !body.ends_with(b"\n") {
+                                f.write_all(b"\n").await?;
+                            }
+                            f.flush().await
+                        }
+                        .await
+                        .is_ok();
+                    }
+                }
+                let resp = if ok {
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = tls.write_all(resp.as_bytes()).await;
+                let _ = tls.flush().await;
+                return;
+            }
+
             // 内置健康检查：自动化测试可直接断言链路活性
             if raw == "/healthz" {
                 let body = format!(
@@ -200,6 +315,30 @@ async fn serve_https(acceptor: TlsAcceptor, root: PathBuf) -> Result<()> {
                 };
                 let head = format!(
                     "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                    status,
+                    body.len()
+                );
+                let _ = tls.write_all(head.as_bytes()).await;
+                let _ = tls.write_all(body.as_bytes()).await;
+                let _ = tls.flush().await;
+                return;
+            }
+
+            // 输入/画面追踪：wwcap 每 5 秒把新增记录追加进 .jsonl，这里直接读文件返回。
+            // 只在白名单来源可访问（上面的 ip_allowed 已经拦过一次）。
+            if raw == "/trace" {
+                let trace_path = std::env::var("WW_TRACE_PATH")
+                    .unwrap_or_else(|_| "/tmp/wwcap-trace.jsonl".to_string());
+                let (status, body) = match tokio::fs::read_to_string(&trace_path).await {
+                    Ok(b) => ("200 OK", b),
+                    Err(_) => (
+                        "503 Service Unavailable",
+                        "{\"type\":\"error\",\"error\":\"还没有追踪数据（wwcap 刚起或没有输入）\"}\n"
+                            .to_string(),
+                    ),
+                };
+                let head = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
                     status,
                     body.len()
                 );
@@ -282,19 +421,24 @@ async fn main() -> Result<()> {
     let _ = std::fs::remove_file(&video_path);
     let video_sock = UnixDatagram::bind(&video_path)
         .with_context(|| format!("绑定 {} 失败", video_path.display()))?;
-    let (tx, _rx) = broadcast::channel::<Arc<Vec<u8>>>(512);
+    /* 512 个分片在 80 Mbps 下只有 ~57ms 缓冲，QUIC 写入稍有停顿就会 Lagged
+       并触发关键帧风暴；2048 约等于 4 帧（1080p60），内存 ~2MB/订阅者。 */
+    let (tx, _rx) = broadcast::channel::<Arc<Vec<u8>>>(2048);
 
     {
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             let mut n_rx: u64 = 0;
+            /* 按时间限流：80 Mbps 下每秒 ~9000 个分片，按计数打印会刷爆 journald */
+            let mut next_log = Instant::now();
             loop {
                 match video_sock.recv(&mut buf).await {
                     Ok(n) if n > 0 => {
                         n_rx += 1;
                         DATAGRAMS_IN.fetch_add(1, Ordering::Relaxed);
-                        if n_rx % 300 == 0 {
+                        if Instant::now() >= next_log {
+                            next_log = Instant::now() + std::time::Duration::from_secs(5);
                             eprintln!("[gw] 已从 wwcap 收到 {n_rx} 个分片（最近 {n} 字节）");
                         }
                         let _ = tx.send(Arc::new(buf[..n].to_vec()));
@@ -405,6 +549,7 @@ async fn main() -> Result<()> {
             let mut down = tokio::spawn(async move {
                 let mut n_tx: u64 = 0;
                 let mut errs: u32 = 0;
+                let mut next_log = Instant::now() + std::time::Duration::from_secs(5);
                 loop {
                     match rx.recv().await {
                         Ok(data) => {
@@ -424,7 +569,8 @@ async fn main() -> Result<()> {
                             errs = 0;
                             n_tx += 1;
                             DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
-                            if n_tx % 300 == 0 {
+                            if Instant::now() >= next_log {
+                                next_log = Instant::now() + std::time::Duration::from_secs(5);
                                 eprintln!("[gw] 已向客户端发出 {n_tx} 个分片");
                             }
                         }

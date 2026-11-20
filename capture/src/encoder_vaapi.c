@@ -9,10 +9,13 @@
 
 #include "encoder.h"
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define WW_SWS_THREADS 4
 
@@ -52,6 +55,8 @@ struct ww_enc {
     bool needs_idr;
     int kind;              /* 0 = vaapi（集显 VDEnc）, 1 = nvenc（独显） */
     bool chroma444;        /* true = yuv444p（仅 NVENC） */
+    int64_t bitrate_bps;   /* >0 = 目标码率；实际是否走 CBR 看 cbr */
+    bool cbr;              /* true = 已按 CBR 打开，qp 不参与码控 */
     struct SwsContext *sws_nv12_444;   /* 零拷贝 NV12 → YUV444P 回退转换 */
     /* 内部分段耗时（微秒） */
     uint64_t stat_conv_us, stat_up_us, stat_send_us, stat_n;
@@ -186,8 +191,29 @@ static int vpp_convert(struct ww_enc *e, VASurfaceID src, VASurfaceID dst)
     return 0;
 }
 
+/* ── 码控能力：CBR（目标码率）不是所有入口都支持 ──
+   实测 HD 630 的 VDEnc（VAEntrypointEncSliceLP）只有 VA_RC_CQP，
+   ffmpeg 会直接报 "Driver does not support CBR RC mode"。 */
+static unsigned vaapi_rc_mask(VADisplay dpy)
+{
+    static const VAEntrypoint eps[] = { VAEntrypointEncSliceLP, VAEntrypointEncSlice };
+    unsigned mask = 0;
+    for (size_t i = 0; i < sizeof(eps) / sizeof(eps[0]); i++) {
+        VAConfigAttrib a;
+        memset(&a, 0, sizeof(a));
+        a.type = VAConfigAttribRateControl;
+        if (vaGetConfigAttributes(dpy, VAProfileH264High, eps[i], &a, 1) == VA_STATUS_SUCCESS
+            && a.value != VA_ATTRIB_NOT_SUPPORTED) {
+            /* 返回的是受支持码控模式的位掩码（见 VAAPI 规范 VAConfigAttribRateControl） */
+            mask |= a.value;
+        }
+    }
+    return mask;
+}
+
 /* ── 独显后端：h264_nvenc（软件 NV12 帧直接送入，NVENC 自行上传）── */
-static struct ww_enc *create_nvenc(struct ww_enc *e, int w, int h, int fps, int qp, bool chroma444)
+static struct ww_enc *create_nvenc(struct ww_enc *e, int w, int h, int fps, int qp, bool chroma444,
+                                  int64_t bitrate_bps)
 {
     const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
     if (!codec) {
@@ -215,27 +241,46 @@ static struct ww_enc *create_nvenc(struct ww_enc *e, int w, int h, int fps, int 
     e->ctx->color_trc = AVCOL_TRC_SMPTE170M;
     e->ctx->color_range = AVCOL_RANGE_MPEG;
 
-    /* 低延迟组合：p4 + ull + 恒定 QP + 不排队 */
+    /* 低延迟组合：p4 + ull + 不排队；码控二选一：CBR（目标码率）或 constqp */
     av_opt_set(e->ctx->priv_data, "preset", "p4", 0);
     av_opt_set(e->ctx->priv_data, "tune", "ull", 0);
-    av_opt_set(e->ctx->priv_data, "rc", "constqp", 0);
-    av_opt_set_int(e->ctx->priv_data, "qp", qp, 0);
+    if (bitrate_bps > 0) {
+        /* NVENC 全系支持 CBR：静态画面也会用填充把瞬时码率顶到目标值 */
+        av_opt_set(e->ctx->priv_data, "rc", "cbr", 0);
+        av_opt_set_int(e->ctx->priv_data, "bitrate", bitrate_bps, 0);
+        av_opt_set_int(e->ctx->priv_data, "maxrate", bitrate_bps, 0);
+        av_opt_set_int(e->ctx->priv_data, "bufsize", bitrate_bps, 0);
+        e->ctx->bit_rate = bitrate_bps;
+        e->ctx->rc_max_rate = bitrate_bps;
+        e->ctx->rc_buffer_size = (int)bitrate_bps;
+        e->cbr = true;
+    } else {
+        av_opt_set(e->ctx->priv_data, "rc", "constqp", 0);
+        av_opt_set_int(e->ctx->priv_data, "qp", qp, 0);
+    }
     av_opt_set_int(e->ctx->priv_data, "delay", 0, 0);
     av_opt_set_int(e->ctx->priv_data, "zerolatency", 1, 0);
 
     if (avcodec_open2(e->ctx, codec, NULL) < 0) {
-        fprintf(stderr, "[enc] h264_nvenc 打开失败（QP=%d）\n", qp);
+        fprintf(stderr, "[enc] h264_nvenc 打开失败（QP=%d，目标码率 %lld bps）\n",
+                qp, (long long)bitrate_bps);
         /* 不释放会让调用方每帧重建时都泄漏一个 AVCodecContext（含 GPU 资源） */
         avcodec_free_context(&e->ctx);
         return NULL;
     }
-    fprintf(stderr, "[enc] h264_nvenc 就绪 %dx%d@%d qp=%d 色度=%s (constqp/ull)\n",
-            w, h, fps, qp, chroma444 ? "4:4:4" : "4:2:0");
+    if (e->cbr) {
+        fprintf(stderr, "[enc] h264_nvenc 就绪 %dx%d@%d 色度=%s 目标码率 %.1f Mbps (cbr/ull)\n",
+                w, h, fps, chroma444 ? "4:4:4" : "4:2:0", (double)bitrate_bps / 1e6);
+    } else {
+        fprintf(stderr, "[enc] h264_nvenc 就绪 %dx%d@%d qp=%d 色度=%s (constqp/ull)\n",
+                w, h, fps, qp, chroma444 ? "4:4:4" : "4:2:0");
+    }
     return e;
 }
 
-struct ww_enc *ww_enc_create_chroma(const char *kind, const char *drm_node,
-                                    int w, int h, int fps, int qp, bool chroma444)
+struct ww_enc *ww_enc_create_full(const char *kind, const char *drm_node,
+                                  int w, int h, int fps, int qp, bool chroma444,
+                                  int64_t bitrate_bps)
 {
     struct ww_enc *e = calloc(1, sizeof(*e));
     if (!e) {
@@ -245,9 +290,10 @@ struct ww_enc *ww_enc_create_chroma(const char *kind, const char *drm_node,
     e->h = h;
     e->fps = fps;
     e->qp = qp;
+    e->bitrate_bps = bitrate_bps > 0 ? bitrate_bps : 0;
 
     if (kind && !strcmp(kind, "nvenc")) {
-        if (!create_nvenc(e, w, h, fps, qp, chroma444)) {
+        if (!create_nvenc(e, w, h, fps, qp, chroma444, e->bitrate_bps)) {
             free(e);
             return NULL;
         }
@@ -302,14 +348,30 @@ struct ww_enc *ww_enc_create_chroma(const char *kind, const char *drm_node,
     e->ctx->profile = FF_PROFILE_H264_HIGH;
     e->ctx->max_b_frames = 0;
     e->ctx->gop_size = 120;
-    /* 必须同时打上 QSCALE 标志，否则 global_quality 会被忽略（QP 永远停在驱动默认值） */
-    e->ctx->flags |= AV_CODEC_FLAG_QSCALE;
-    e->ctx->global_quality = qp * FF_QP2LAMBDA;
     e->ctx->hw_frames_ctx = av_buffer_ref(e->frames);
     e->ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
-    if (av_opt_set(e->ctx->priv_data, "rc_mode", "CQP", 0) < 0) {
-        fprintf(stderr, "[enc] 设置 rc_mode=CQP 失败\n");
+    /* 目标码率只有在驱动支持 CBR 时才有意义（HD 630 的 VDEnc 实测只有 CQP） */
+    if (e->bitrate_bps > 0 && (vaapi_rc_mask(e->dpy) & VA_RC_CBR)) {
+        e->ctx->bit_rate = e->bitrate_bps;
+        e->ctx->rc_max_rate = e->bitrate_bps;
+        e->ctx->rc_buffer_size = (int)e->bitrate_bps;
+        if (av_opt_set(e->ctx->priv_data, "rc_mode", "CBR", 0) == 0) {
+            e->cbr = true;
+        }
+    }
+    if (!e->cbr) {
+        if (e->bitrate_bps > 0) {
+            fprintf(stderr, "[enc] 驱动不支持 CBR，目标码率 %.1f Mbps 忽略（仅 CQP）\n",
+                    (double)e->bitrate_bps / 1e6);
+        }
+        e->bitrate_bps = 0;
+        /* 必须同时打上 QSCALE 标志，否则 global_quality 会被忽略（QP 永远停在驱动默认值） */
+        e->ctx->flags |= AV_CODEC_FLAG_QSCALE;
+        e->ctx->global_quality = qp * FF_QP2LAMBDA;
+        if (av_opt_set(e->ctx->priv_data, "rc_mode", "CQP", 0) < 0) {
+            fprintf(stderr, "[enc] 设置 rc_mode=CQP 失败\n");
+        }
     }
     av_opt_set_int(e->ctx->priv_data, "low_power", 1, 0);
     /* async_depth 决定编码器里"在途"的帧数：每多存一帧就多一帧显示延迟。
@@ -324,7 +386,8 @@ struct ww_enc *ww_enc_create_chroma(const char *kind, const char *drm_node,
     e->ctx->color_range = AVCOL_RANGE_MPEG;
 
     if (avcodec_open2(e->ctx, codec, NULL) < 0) {
-        fprintf(stderr, "[enc] avcodec_open2 失败（QP=%d）\n", qp);
+        fprintf(stderr, "[enc] avcodec_open2 失败（QP=%d，目标码率 %lld bps）\n",
+                qp, (long long)e->bitrate_bps);
         goto fail;
     }
 
@@ -333,7 +396,12 @@ struct ww_enc *ww_enc_create_chroma(const char *kind, const char *drm_node,
         fprintf(stderr, "[enc] 驱动未提供 VPP，回退 CPU 色彩转换（ARGB→NV12）\n");
     }
 
-    fprintf(stderr, "[enc] h264_vaapi 就绪 %dx%d@%d qp=%d (VDEnc/CQP)\n", w, h, fps, qp);
+    if (e->cbr) {
+        fprintf(stderr, "[enc] h264_vaapi 就绪 %dx%d@%d 目标码率 %.1f Mbps (VDEnc/CBR)\n",
+                w, h, fps, (double)e->bitrate_bps / 1e6);
+    } else {
+        fprintf(stderr, "[enc] h264_vaapi 就绪 %dx%d@%d qp=%d (VDEnc/CQP)\n", w, h, fps, qp);
+    }
     return e;
 
 fail:
@@ -352,6 +420,12 @@ fail:
     return NULL;
 }
 
+struct ww_enc *ww_enc_create_chroma(const char *kind, const char *drm_node,
+                                    int w, int h, int fps, int qp, bool chroma444)
+{
+    return ww_enc_create_full(kind, drm_node, w, h, fps, qp, chroma444, 0);
+}
+
 struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
                                 int w, int h, int fps, int qp)
 {
@@ -361,6 +435,30 @@ struct ww_enc *ww_enc_create_ex(const char *kind, const char *drm_node,
 struct ww_enc *ww_enc_create(const char *drm_node, int w, int h, int fps, int qp)
 {
     return ww_enc_create_ex("vaapi", drm_node, w, h, fps, qp);
+}
+
+/* 探测目标码率（CBR）能力：NVENC 全系支持；VAAPI 取决于驱动的码控属性 */
+bool ww_enc_probe_cbr(const char *kind, const char *drm_node)
+{
+    if (kind && !strcmp(kind, "nvenc")) {
+        return avcodec_find_encoder_by_name("h264_nvenc") != NULL;
+    }
+    if (!drm_node || !*drm_node) {
+        return false;
+    }
+    int fd = open(drm_node, O_RDWR);
+    if (fd < 0) {
+        return false;
+    }
+    VADisplay dpy = vaGetDisplayDRM(fd);
+    int maj = 0, min = 0;
+    bool cbr = false;
+    if (dpy && vaInitialize(dpy, &maj, &min) == VA_STATUS_SUCCESS) {
+        cbr = (vaapi_rc_mask(dpy) & VA_RC_CBR) != 0;
+        vaTerminate(dpy);
+    }
+    close(fd);
+    return cbr;
 }
 
 bool ww_enc_probe_444(const char *kind, const char *drm_node)
@@ -730,6 +828,10 @@ int ww_enc_set_qp(struct ww_enc *e, int qp)
         return 0;
     }
     e->qp = qp;
+    if (e->cbr) {
+        /* CBR 下码率说话，QP 不再参与码控；调用方应把目标码率设为 0 再改 QP */
+        return 0;
+    }
     if (e->kind == 1) {
         /* NVENC 的 constqp 参数在私有的 priv_data 里 */
         av_opt_set_int(e->ctx->priv_data, "qp", qp, 0);
@@ -741,6 +843,27 @@ int ww_enc_set_qp(struct ww_enc *e, int qp)
     /* CQP 下改动 global_quality 需要重建编码器才能稳定生效，这里标记下次强制 IDR 平滑过渡 */
     e->needs_idr = true;
     return 0;
+}
+
+int64_t ww_enc_set_bitrate(struct ww_enc *e, int64_t bps)
+{
+    if (!e || !e->cbr || bps <= 0 || bps == e->bitrate_bps) {
+        return e && e->cbr ? e->bitrate_bps : 0;
+    }
+    e->bitrate_bps = bps;
+    e->ctx->bit_rate = bps;
+    e->ctx->rc_max_rate = bps;
+    e->ctx->rc_buffer_size = (int)bps;
+    av_opt_set_int(e->ctx->priv_data, "bitrate", bps, 0);
+    av_opt_set_int(e->ctx->priv_data, "maxrate", bps, 0);
+    av_opt_set_int(e->ctx->priv_data, "bufsize", bps, 0);
+    e->needs_idr = true;
+    return e->bitrate_bps;
+}
+
+bool ww_enc_is_cbr(struct ww_enc *e)
+{
+    return e && e->cbr;
 }
 
 void ww_enc_destroy(struct ww_enc *e)

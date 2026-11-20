@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -21,6 +22,7 @@
 #include <linux/dma-buf.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/sysmacros.h>
 #include <sys/un.h>
@@ -110,6 +112,10 @@ struct ww {
     uint64_t last_frame_us;
     int fps;
     int qp;
+    /* 目标码率（bps）：0 = 关闭，走 CQP。cbr_avail 是当前编码器的能力，
+       不支持时 bitrate_bps 会被清零（否则 UI 会以为设置生效了） */
+    int64_t bitrate_bps;
+    bool cbr_avail;
     bool need_idr;
     uint64_t frames_sent, bytes_sent;
     bool first_send_logged;
@@ -143,7 +149,45 @@ struct ww {
     bool active;
     bool suspended;
     uint64_t idle_since_us;   /* 最后一个客户端离开的时刻；0 表示当前有会话 */
+
+    /* ── 输入/画面追踪（排障用）────────────────────────────────
+       鼠标"卡"这类问题靠肉眼说不清，这里把每条输入的「收到→注入完成」耗时、
+       每条出站帧的「帧号/pts/字节/发送时刻」记进环形缓冲，每 5 秒把**新增**记录
+       追加到 /tmp/wwcap-trace.jsonl（一行一条，可 tail -f / jq），2MB 轮转。
+       追加而非整体重写：文件任何时刻都是完整可读的行式日志，也不会有覆盖空窗。 */
+    struct ww_tr_in {
+        uint64_t t_recv, t_done;
+        double ts_client;      /* 客户端 performance.now()，用于对齐两边时钟 */
+        double x, y;           /* pm 是归一化坐标（0~1），必须是浮点，截断会全变 0 */
+        uint8_t kind;          /* WW_TR_* */
+    } tr_in[1024];
+    uint32_t tr_in_head;       /* 累计写入条数（环形下标 = head % N） */
+    uint32_t tr_in_flushed;    /* 已落盘的累计条数 */
+    struct ww_tr_frm {
+        uint64_t t_send;
+        int64_t pts;
+        uint32_t bytes, id;
+        uint8_t key;
+        /* 该帧里画进去的光标位置（归一化 0~1）。
+           这是判定"鼠标卡不卡"的关键：客户端拿它和自己当时的指针位置对比，
+           就能算出"画面上看到的光标比手落后了多少"（按坐标匹配，不依赖对钟）。 */
+        float cx, cy;
+    } tr_frm[512];
+    uint32_t tr_frm_head;
+    uint32_t tr_frm_flushed;
+    /* 最近一次注入的指针归一化坐标（pm 消息带来的） */
+    double cur_x, cur_y;
+    bool cur_valid;
+    uint64_t tr_flush_at;
+    bool tr_dirty;
 };
+
+enum { WW_TR_PM = 0, WW_TR_PR, WW_TR_PB, WW_TR_PW, WW_TR_KK };
+
+/* 追踪接口（定义在下面，handle_ctrl 先用） */
+static void tr_input(struct ww *w, uint8_t kind, double x, double y,
+                     double ts_client, uint64_t t_recv);
+static void trace_flush(struct ww *w);
 
 enum { WW_STRAT_BALANCE = 0, WW_STRAT_SMOOTH = 1, WW_STRAT_QUALITY = 2, WW_STRAT_CUSTOM = 3 };
 
@@ -313,7 +357,8 @@ static int strategy_preset_qp(int s)
     }
 }
 
-/* 供网关 /capabilities 读取：客户端据此置灰 4:4:4 开关 */
+/* 供网关 /capabilities 读取：客户端据此置灰 4:4:4 与目标码率开关。
+   rc = "cbr" 表示可按目标码率编码；"cqp" 表示码率只能随画面浮动。 */
 static void caps_write(struct ww *w)
 {
     const char *path = getenv("WW_CAPS_PATH");
@@ -324,8 +369,14 @@ static void caps_write(struct ww *w)
     if (!f) {
         return;
     }
-    fprintf(f, "{\"chroma444\":%d,\"encoder\":\"%s\"}\n",
-            w->chroma444_avail ? 1 : 0, w->enc_kind ? w->enc_kind : "");
+    /* cursor=local：服务端用全透明光标主题（XCURSOR_THEME=ww-invisible）让合成器
+       不把光标画进画面，客户端自己画一个——这样光标延迟是 0，而不是视频的两三帧。
+       WW_CURSOR=server 可回退成"光标在视频里"的老行为。 */
+    const char *cur = getenv("WW_CURSOR");
+    const char *cur_mode = (cur && !strcmp(cur, "server")) ? "server" : "local";
+    fprintf(f, "{\"chroma444\":%d,\"encoder\":\"%s\",\"rc\":\"%s\",\"bitrate_bps\":%lld,\"cursor\":\"%s\"}\n",
+            w->chroma444_avail ? 1 : 0, w->enc_kind ? w->enc_kind : "",
+            w->cbr_avail ? "cbr" : "cqp", (long long)w->bitrate_bps, cur_mode);
     fclose(f);
 }
 
@@ -357,6 +408,24 @@ static void chroma_refresh(struct ww *w)
         w->chroma444 = want;
         fprintf(stderr, "[enc] 色度采样 -> %s\n", want ? "4:4:4" : "4:2:0");
         encoder_restart(w);
+    }
+    caps_write(w);
+}
+
+/* 目标码率能力刷新：换编码器（vaapi ↔ nvenc）后必须重新探测，
+   否则切到集显时客户端仍以为能设码率。 */
+static void bitrate_refresh(struct ww *w)
+{
+    bool avail = ww_enc_probe_cbr(w->enc_kind, w->drm);
+    if (avail != w->cbr_avail) {
+        fprintf(stderr, "[enc] 目标码率（CBR）%s（编码器 %s）\n",
+                avail ? "可用" : "不可用，仅 CQP", w->enc_kind ? w->enc_kind : "?");
+    }
+    w->cbr_avail = avail;
+    if (!avail && w->bitrate_bps) {
+        fprintf(stderr, "[enc] 目标码率 %.1f Mbps 失效，回退 QP %d\n",
+                (double)w->bitrate_bps / 1e6, w->qp);
+        w->bitrate_bps = 0;
     }
     caps_write(w);
 }
@@ -413,6 +482,8 @@ static void apply_strategy(struct ww *w, int s)
 
 static void handle_ctrl(struct ww *w, const char *msg)
 {
+    /* 输入追踪的起点：消息从网关到达 wwcap 的时刻（决定上游延迟能否被观测到） */
+    uint64_t t_recv = now_us();
     const char *t = strstr(msg, "\"t\":\"");
     if (!t) return;
     t += 5;
@@ -421,20 +492,57 @@ static void handle_ctrl(struct ww *w, const char *msg)
 
     if (strcmp(type, "pm") == 0) {
         ww_input_motion_abs(w->input, jnum(msg, "x", 0), jnum(msg, "y", 0));
+        tr_input(w, WW_TR_PM, jnum(msg, "x", 0), jnum(msg, "y", 0), jnum(msg, "ts", 0), t_recv);
     } else if (strcmp(type, "pr") == 0) {
         ww_input_motion_rel(w->input, jnum(msg, "dx", 0), jnum(msg, "dy", 0));
+        tr_input(w, WW_TR_PR, jnum(msg, "dx", 0), jnum(msg, "dy", 0), jnum(msg, "ts", 0), t_recv);
     } else if (strcmp(type, "pb") == 0) {
         ww_input_button(w->input, (uint32_t)jnum(msg, "b", 1), jnum(msg, "d", 0) > 0);
+        tr_input(w, WW_TR_PB, jnum(msg, "b", 1), jnum(msg, "d", 0), jnum(msg, "ts", 0), t_recv);
     } else if (strcmp(type, "pw") == 0) {
         ww_input_axis(w->input, jnum(msg, "v", 0));
+        tr_input(w, WW_TR_PW, jnum(msg, "v", 0), 0, jnum(msg, "ts", 0), t_recv);
     } else if (strcmp(type, "kk") == 0) {
         ww_input_key(w->input, (uint32_t)jnum(msg, "k", 0), jnum(msg, "d", 0) > 0);
+        tr_input(w, WW_TR_KK, jnum(msg, "k", 0), jnum(msg, "d", 0), jnum(msg, "ts", 0), t_recv);
+    } else if (strcmp(type, "trace") == 0) {
+        /* 客户端要求立刻落盘（导出一份"当前状态"的追踪） */
+        trace_flush(w);
     } else if (strcmp(type, "qp") == 0) {
         /* 手动调 QP -> 进入「自定义」，策略不再覆盖 */
         w->strategy = WW_STRAT_CUSTOM;
         w->qp = (int)jnum(msg, "v", w->qp);
         ww_enc_set_qp(w->enc, w->qp);
         fprintf(stderr, "[cap] QP -> %d（自定义）\n", w->qp);
+    } else if (strcmp(type, "bitrate") == 0) {
+        /* 目标码率（bps）：0 = 关闭，回到 QP 控制。
+           当前编码器只支持 CQP 时直接忽略，避免前端以为设置生效。 */
+        int64_t v = (int64_t)jnum(msg, "v", 0);
+        if (v < 0) v = 0;
+        if (v > 200000000) v = 200000000;
+        if (v > 0 && !w->cbr_avail) {
+            fprintf(stderr, "[cap] 目标码率 %.1f Mbps 被忽略：当前编码器只支持 CQP\n",
+                    (double)v / 1e6);
+            v = 0;
+        }
+        if (v != w->bitrate_bps) {
+            w->bitrate_bps = v;
+            if (w->enc) {
+                /* 码控模式在 avcodec_open2 时确定：CQP ↔ CBR 切换必须重建 */
+                if ((v > 0) != ww_enc_is_cbr(w->enc)) {
+                    encoder_restart(w);
+                } else {
+                    ww_enc_set_bitrate(w->enc, v);
+                    w->need_idr = true;
+                }
+            }
+            if (v > 0) {
+                fprintf(stderr, "[cap] 目标码率 -> %.1f Mbps\n", (double)v / 1e6);
+            } else {
+                fprintf(stderr, "[cap] 目标码率 -> 关闭（QP %d 控制）\n", w->qp);
+            }
+            caps_write(w);
+        }
     } else if (strcmp(type, "strategy") == 0) {
         apply_strategy(w, (int)jnum(msg, "v", WW_STRAT_BALANCE));
     } else if (strcmp(type, "chroma") == 0) {
@@ -487,22 +595,18 @@ static void handle_ctrl(struct ww *w, const char *msg)
     } else if (strcmp(type, "enc") == 0) {
         char v[16];
         if (jstr(msg, "v", v, sizeof(v)) && strcmp(v, w->enc_kind) != 0) {
-#ifdef HAVE_SC_CAPTURE
-            if (w->sc && strcmp(v, "nvenc") != 0) {
-                fprintf(stderr, "[cap] 零拷贝抓帧只支持 nvenc，忽略 %s\n", v);
-            } else
-#endif
-            {
-                const char *kind = (!strcmp(v, "nvenc")) ? "nvenc" : "vaapi";
-                fprintf(stderr, "[cap] 切换编码器 %s -> %s\n", w->enc_kind, kind);
-                w->enc_kind = kind;
-                /* 下一帧发现尺寸不符时会自动销毁重建 —— 这里把基准清掉即可 */
-                w->enc_w = 0;
-                w->enc_h = 0;
-                w->need_idr = true;
-                /* 换编码器会改变 4:4:4 能力：集显不支持时自动回退 4:2:0 */
-                chroma_refresh(w);
-            }
+            const char *kind = (!strcmp(v, "nvenc")) ? "nvenc" : "vaapi";
+            fprintf(stderr, "[cap] 切换编码器 %s -> %s\n", w->enc_kind, kind);
+            w->enc_kind = kind;
+            /* 下一帧发现尺寸不符时会自动销毁重建 —— 这里把基准清掉即可 */
+            w->enc_w = 0;
+            w->enc_h = 0;
+            w->need_idr = true;
+            /* 换编码器会改变 4:4:4 与目标码率能力：不支持时自动回退 */
+            chroma_refresh(w);
+            bitrate_refresh(w);
+            /* 能力变化后按新编码器重建，别等下一帧才发现 */
+            encoder_restart(w);
         }
     } else if (strcmp(type, "kf") == 0) {
         w->need_idr = true;
@@ -652,6 +756,86 @@ static void dump_ppm_bytes(struct ww *w, const void *base, uint32_t stride)
     fprintf(stderr, "[cap] 已落盘 /tmp/ww-capture.ppm（%ux%u）\n", w->width, w->height);
 }
 
+/* ── 输入/画面追踪 ──────────────────────────────────────────── */
+#define WW_TR_IN_N ((uint32_t)(sizeof(((struct ww *)0)->tr_in) / sizeof(((struct ww *)0)->tr_in[0])))
+#define WW_TR_FR_N ((uint32_t)(sizeof(((struct ww *)0)->tr_frm) / sizeof(((struct ww *)0)->tr_frm[0])))
+
+/* 记录一条输入：t_recv 由调用方在收到消息时取，t_done 在注入返回后取 */
+static void tr_input(struct ww *w, uint8_t kind, double x, double y,
+                     double ts_client, uint64_t t_recv)
+{
+    if (kind == WW_TR_PM) {
+        /* 记住最后一次注入的归一化坐标：下一帧里画进去的光标就在这个位置 */
+        w->cur_x = x;
+        w->cur_y = y;
+        w->cur_valid = true;
+    }
+    struct ww_tr_in *e = &w->tr_in[w->tr_in_head % WW_TR_IN_N];
+    e->t_recv = t_recv;
+    e->t_done = now_us();
+    e->ts_client = ts_client;
+    e->x = x;
+    e->y = y;
+    e->kind = kind;
+    w->tr_in_head++;
+    w->tr_dirty = true;
+}
+
+/* 追加落盘（5 秒一次，或收到 trace 控制消息时立刻写）：
+   一行一条记录（type=in / type=frm），文件是纯追加的，2MB 轮转成 .1。
+   只写"上次落盘之后新增"的记录；环形缓冲被覆盖时（落后超过容量）从最旧可读位置开始。 */
+static void trace_flush(struct ww *w)
+{
+    if (!w->tr_dirty) {
+        return;
+    }
+    w->tr_dirty = false;
+    const char *path = getenv("WW_TRACE_PATH");
+    if (!path || !*path) {
+        path = "/tmp/wwcap-trace.jsonl";
+    }
+    const size_t max_bytes = 2 * 1024 * 1024;
+
+    struct stat st;
+    if (stat(path, &st) == 0 && (size_t)st.st_size > max_bytes) {
+        char bak[PATH_MAX];
+        snprintf(bak, sizeof(bak), "%s.1", path);
+        rename(path, bak);   /* 只保留一份旧档 */
+    }
+
+    FILE *f = fopen(path, "a");
+    if (!f) {
+        return;
+    }
+    static const char *KN[] = { "pm", "pr", "pb", "pw", "kk" };
+
+    uint32_t from = w->tr_in_flushed;
+    if (w->tr_in_head - from > WW_TR_IN_N) {
+        from = w->tr_in_head - WW_TR_IN_N;
+    }
+    for (uint32_t i = from; i < w->tr_in_head; i++) {
+        const struct ww_tr_in *e = &w->tr_in[i % WW_TR_IN_N];
+        fprintf(f, "{\"type\":\"in\",\"k\":\"%s\",\"t\":%llu,\"d\":%llu,\"ts\":%.3f,\"x\":%.5f,\"y\":%.5f}\n",
+                KN[e->kind & 7], (unsigned long long)e->t_recv,
+                (unsigned long long)(e->t_done - e->t_recv), e->ts_client,
+                (double)e->x, (double)e->y);
+    }
+    w->tr_in_flushed = w->tr_in_head;
+
+    from = w->tr_frm_flushed;
+    if (w->tr_frm_head - from > WW_TR_FR_N) {
+        from = w->tr_frm_head - WW_TR_FR_N;
+    }
+    for (uint32_t i = from; i < w->tr_frm_head; i++) {
+        const struct ww_tr_frm *e = &w->tr_frm[i % WW_TR_FR_N];
+        fprintf(f, "{\"type\":\"frm\",\"id\":%u,\"t\":%llu,\"pts\":%lld,\"n\":%u,\"key\":%u,\"cx\":%.4f,\"cy\":%.4f}\n",
+                e->id, (unsigned long long)e->t_send, (long long)e->pts, e->bytes, e->key,
+                (double)e->cx, (double)e->cy);
+    }
+    w->tr_frm_flushed = w->tr_frm_head;
+    fclose(f);
+}
+
 static void send_packet(struct ww *w, const struct ww_nal_out *nal)
 {
     /* 首个访问单元落盘，用于 ffprobe 校验码流合法性 */
@@ -703,6 +887,18 @@ static void send_packet(struct ww *w, const struct ww_nal_out *nal)
                 fprintf(stderr, "[cap] 首个分片已发送 %zd 字节 -> %s\n", n, w->video_addr.sun_path);
             }
         }
+    }
+    {
+        struct ww_tr_frm *fr = &w->tr_frm[w->tr_frm_head % WW_TR_FR_N];
+        fr->t_send = now_us();
+        fr->pts = (int64_t)nal->pts_us;
+        fr->bytes = (uint32_t)nal->len;
+        fr->id = w->frame_id;
+        fr->key = nal->keyframe ? 1 : 0;
+        fr->cx = w->cur_valid ? (float)w->cur_x : -1.0f;
+        fr->cy = w->cur_valid ? (float)w->cur_y : -1.0f;
+        w->tr_frm_head++;
+        w->tr_dirty = true;
     }
     w->frame_id++;
     w->frames_sent++;
@@ -972,8 +1168,8 @@ static void on_shm_frame(void *ud, const void *data, uint32_t stride,
             ww_enc_destroy(w->enc);
             w->enc = NULL;
         }
-        w->enc = ww_enc_create_chroma(w->enc_kind, w->drm, (int)fw, (int)fh,
-                                      w->fps, w->qp, w->chroma444);
+        w->enc = ww_enc_create_full(w->enc_kind, w->drm, (int)fw, (int)fh,
+                                    w->fps, w->qp, w->chroma444, w->bitrate_bps);
         if (!w->enc) {
             if (encoder_fallback_420(w)) {
                 w->enc_w = w->enc_h = 0;   /* 下一帧按 4:2:0 重建 */
@@ -1045,8 +1241,8 @@ static void on_sc_frame(void *ud, const uint8_t *y, uint32_t ys,
             ww_enc_destroy(w->enc);
             w->enc = NULL;
         }
-        w->enc = ww_enc_create_chroma(w->enc_kind, w->drm, (int)fw, (int)fh,
-                                      w->fps, w->qp, w->chroma444);
+        w->enc = ww_enc_create_full(w->enc_kind, w->drm, (int)fw, (int)fh,
+                                    w->fps, w->qp, w->chroma444, w->bitrate_bps);
         if (!w->enc) {
             if (encoder_fallback_420(w)) {
                 w->enc_w = w->enc_h = 0;   /* 下一帧按 4:2:0 重建 */
@@ -1113,6 +1309,7 @@ int main(int argc, char **argv)
     const char *ctrl_path = NULL;
     const char *audio_path = NULL;   /* --audio：不给就整条音频链路关闭 */
     int qp = 20, fps = 60;   /* CQP 是唯一可调项：20 明显比默认值清晰，码率仍可接受 */
+    double bitrate_mbps = 0; /* --bitrate：0 = 关闭目标码率，走 QP（集显只支持这条） */
     bool dump_once = false;
     uint32_t max_w = 3200, max_h = 1800;   /* 默认上限：本机 4K 回读撑不住 30fps */
     const char *enc_kind = "vaapi";        /* 默认集显；--enc nvenc 走独显 */
@@ -1128,6 +1325,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--audio") && i + 1 < argc) audio_path = argv[++i];
         else if (!strcmp(argv[i], "--qp") && i + 1 < argc) qp = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) fps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bitrate") && i + 1 < argc) bitrate_mbps = atof(argv[++i]);
         else if (!strcmp(argv[i], "--dump")) dump_once = true;
         else if (!strcmp(argv[i], "--capture") && i + 1 < argc) cap_mode = argv[++i];
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) output_name = argv[++i];
@@ -1156,7 +1354,7 @@ int main(int argc, char **argv)
 #endif
     if (!video_path || !ctrl_path) {
         fprintf(stderr, "用法: wwcap --video <sock> --ctrl <sock> [--audio <sock>] "
-                        "[--drm node] [--qp N] [--fps N]\n");
+                        "[--drm node] [--qp N] [--fps N] [--bitrate Mbps]\n");
         return 2;
     }
 
@@ -1204,6 +1402,9 @@ int main(int argc, char **argv)
     w.enc_kind = enc_kind;
     w.output_name = output_name;
     w.dump_once = dump_once;
+    w.bitrate_bps = bitrate_mbps > 0 ? (int64_t)(bitrate_mbps * 1e6) : 0;
+    /* 先探能力：不支持 CBR 的编码器上目标码率必须清零，否则 UI 会显示一个假设置值 */
+    bitrate_refresh(&w);
 
     w.dpy = wl_display_connect(NULL);
     if (!w.dpy) { fprintf(stderr, "无法连接 Wayland\n"); return 1; }
@@ -1276,11 +1477,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "[cap] 抓帧目标 %ux%u fourcc=0x%x modifier=0x%llx stride=%u\n",
                 w.width, w.height, w.fourcc, (unsigned long long)w.modifier, w.stride);
 
-        w.enc = ww_enc_create_chroma(enc_kind, drm, (int)w.width, (int)w.height,
-                                     fps, qp, w.chroma444);
+        w.enc = ww_enc_create_full(enc_kind, drm, (int)w.width, (int)w.height,
+                                   fps, qp, w.chroma444, w.bitrate_bps);
         if (!w.enc && encoder_fallback_420(&w)) {
-            w.enc = ww_enc_create_chroma(enc_kind, drm, (int)w.width, (int)w.height,
-                                         fps, qp, false);
+            w.enc = ww_enc_create_full(enc_kind, drm, (int)w.width, (int)w.height,
+                                       fps, qp, false, w.bitrate_bps);
         }
         if (!w.enc) { fprintf(stderr, "编码器初始化失败\n"); return 1; }
         w.enc_w = w.width;
@@ -1419,6 +1620,15 @@ int main(int argc, char **argv)
             if (wl_display_dispatch(w.dpy) == -1) break;
         }
 
+        /* 追踪落盘：5 秒一次整体覆盖写，只有产生新事件时才写 */
+        {
+            uint64_t tn = now_us();
+            if (w.tr_dirty && tn >= w.tr_flush_at) {
+                trace_flush(&w);
+                w.tr_flush_at = tn + 5000000ull;
+            }
+        }
+
         /* 新输出刚绑定：roundtrip 一次拿到它的初始 geometry/mode/scale，
            再重算输入布局（否则新插入的显示器不会计入布局） */
         if (w.layout_dirty) {
@@ -1531,9 +1741,10 @@ int main(int argc, char **argv)
                 cap_ms = ww_sc_take_cap_ms(w.sc);
             }
 #endif
-            fprintf(stderr, "[cap] %.1f fps, %.2f Mbps, frames=%llu | cap %.1fms conv %.1fms enc %.1fms\n",
+            fprintf(stderr, "[cap] %.1f fps, %.2f Mbps%s, frames=%llu | cap %.1fms conv %.1fms enc %.1fms\n",
                     (double)(w.frames_sent - stat_frames) * 1e6 / (double)(t - stat_t),
                     (double)w.bytes_sent * 8.0 / (double)(t - stat_t),
+                    w.bitrate_bps > 0 ? " (目标码率)" : " (CQP)",
                     (unsigned long long)w.frames_sent,
                     cap_ms,
                     (double)w.acc_conv_us / n / 1000.0,

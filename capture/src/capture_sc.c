@@ -24,6 +24,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -776,8 +778,82 @@ double ww_sc_take_cap_ms(struct ww_sc *s)
     return ms;
 }
 
+/* ── DRM 节点归属判定 ─────────────────────────────────────────
+ * EGL 上下文必须和抓帧的 gbm 设备在同一张卡上：跨卡导入 tiled dmabuf 会直接
+ * EGL_BAD_PARAMETER（实测：i915 的 Y-tiled 缓冲导入 NVIDIA 的 EGL 上下文即失败）。
+ * cardN 与 renderDNNN 是两个节点，但在 sysfs 里指向同一个 PCI device，
+ * 所以用 /sys/class/drm/<node>/device 的 realpath 比较，避免混淆两种节点名。 */
+static bool node_same_gpu(const char *a, const char *b)
+{
+    if (!a || !b || !*a || !*b) {
+        return false;
+    }
+    char pa[PATH_MAX], pb[PATH_MAX], ra[PATH_MAX], rb[PATH_MAX];
+    const char *ba = strrchr(a, '/');
+    const char *bb = strrchr(b, '/');
+    ba = ba ? ba + 1 : a;
+    bb = bb ? bb + 1 : b;
+    snprintf(pa, sizeof(pa), "/sys/class/drm/%s/device", ba);
+    snprintf(pb, sizeof(pb), "/sys/class/drm/%s/device", bb);
+    if (!realpath(pa, ra) || !realpath(pb, rb)) {
+        return false;
+    }
+    return strcmp(ra, rb) == 0;
+}
+
+/* 该 DRM 节点是否是 NVIDIA 卡（vendor 0x10de） */
+static bool node_is_nvidia(const char *node)
+{
+    if (!node || !*node) {
+        return false;
+    }
+    char p[PATH_MAX], buf[64] = {0};
+    const char *b = strrchr(node, '/');
+    b = b ? b + 1 : node;
+    snprintf(p, sizeof(p), "/sys/class/drm/%s/device/vendor", b);
+    FILE *f = fopen(p, "r");
+    if (!f) {
+        return false;
+    }
+    bool ok = fgets(buf, sizeof(buf), f) && strstr(buf, "0x10de");
+    fclose(f);
+    return ok;
+}
+
+/* EGL 设备对应的 DRM 节点（优先 render node，其次 primary node） */
+static const char *egl_device_node(EGLDeviceEXT dev, char *out, size_t n)
+{
+    /* 扩展入口不在 libEGL 的导出符号里，必须走 eglGetProcAddress */
+    PFNEGLQUERYDEVICESTRINGEXTPROC qs =
+        (PFNEGLQUERYDEVICESTRINGEXTPROC)eglGetProcAddress("eglQueryDeviceStringEXT");
+    if (!qs) {
+        return NULL;
+    }
+    const char *exts = qs(dev, EGL_EXTENSIONS);
+    if (!exts) {
+        return NULL;
+    }
+#ifdef EGL_DRM_RENDER_NODE_FILE_EXT
+    if (strstr(exts, "EGL_EXT_device_drm_render_node")) {
+        const char *p = qs(dev, EGL_DRM_RENDER_NODE_FILE_EXT);
+        if (p && *p) {
+            snprintf(out, n, "%s", p);
+            return out;
+        }
+    }
+#endif
+    if (strstr(exts, "EGL_EXT_device_drm")) {
+        const char *p = qs(dev, EGL_DRM_DEVICE_FILE_EXT);
+        if (p && *p) {
+            snprintf(out, n, "%s", p);
+            return out;
+        }
+    }
+    return NULL;
+}
+
 /* ── EGL / GL 初始化 ───────────────────────────────────────── */
-static int init_egl_gl(struct ww_sc *s)
+static int init_egl_gl(struct ww_sc *s, const char *want_node)
 {
     PFNEGLQUERYDEVICESEXTPROC query_devices =
         (PFNEGLQUERYDEVICESEXTPROC)eglGetProcAddress("eglQueryDevicesEXT");
@@ -817,8 +893,30 @@ static int init_egl_gl(struct ww_sc *s)
         fprintf(stderr, "[sc] eglQueryDevicesEXT 失败\n");
         return -1;
     }
-    EGLDisplay fallback = EGL_NO_DISPLAY;
-    for (EGLint i = 0; i < nd; i++) {
+    /* 先按 DRM 节点定位要用的设备：抓帧缓冲来自整个 gbm 卡，
+       GL 必须落在同一张卡上，否则 dmabuf 导入必失败。 */
+    EGLint want_idx = -1;
+    if (want_node && *want_node) {
+        for (EGLint i = 0; i < nd; i++) {
+            char nb[PATH_MAX];
+            const char *n = egl_device_node(devs[i], nb, sizeof(nb));
+            if (n && node_same_gpu(n, want_node)) {
+                want_idx = i;
+                break;
+            }
+        }
+        if (want_idx >= 0) {
+            fprintf(stderr, "[sc] EGL 设备 %d 与抓帧卡 %s 同属一张 GPU\n", want_idx, want_node);
+        } else {
+            /* 不匹配就退回旧行为，但明确告警：跨卡导入 tiled dmabuf 会失败 */
+            fprintf(stderr, "[sc] 没有 EGL 设备对应 %s（跨卡导入大概率失败）\n", want_node);
+        }
+    }
+
+    EGLDisplay inited[8];
+    EGLint inited_idx[8];
+    EGLint ninit = 0;
+    for (EGLint i = 0; i < nd && ninit < 8; i++) {
         EGLDisplay d = get_platform_display(EGL_PLATFORM_DEVICE_EXT, devs[i], NULL);
         EGLint major = 0, minor = 0;
         if (d == EGL_NO_DISPLAY || !eglInitialize(d, &major, &minor)) {
@@ -826,18 +924,39 @@ static int init_egl_gl(struct ww_sc *s)
         }
         const char *vendor = eglQueryString(d, EGL_VENDOR);
         fprintf(stderr, "[sc] EGL[%d] %s\n", i, vendor ? vendor : "-");
-        if (vendor && strstr(vendor, "NVIDIA")) {
-            s->edpy = d;
-            break;
+        inited[ninit] = d;
+        inited_idx[ninit] = i;
+        ninit++;
+        if (i == want_idx) {
+            break;   /* 命中目标设备，其余不必再初始化 */
         }
-        if (fallback == EGL_NO_DISPLAY) {
-            fallback = d;
-        } else {
-            eglTerminate(d);
+    }
+
+    /* 选定：节点匹配优先；否则沿用「NVIDIA 优先」的旧策略，再否则取第一个 */
+    if (want_idx >= 0) {
+        for (EGLint k = 0; k < ninit; k++) {
+            if (inited_idx[k] == want_idx) {
+                s->edpy = inited[k];
+                break;
+            }
         }
     }
     if (s->edpy == EGL_NO_DISPLAY) {
-        s->edpy = fallback;
+        for (EGLint k = 0; k < ninit; k++) {
+            const char *v = eglQueryString(inited[k], EGL_VENDOR);
+            if (v && strstr(v, "NVIDIA")) {
+                s->edpy = inited[k];
+                break;
+            }
+        }
+    }
+    if (s->edpy == EGL_NO_DISPLAY && ninit > 0) {
+        s->edpy = inited[0];
+    }
+    for (EGLint k = 0; k < ninit; k++) {
+        if (inited[k] != s->edpy) {
+            eglTerminate(inited[k]);
+        }
     }
     if (s->edpy == EGL_NO_DISPLAY) {
         fprintf(stderr, "[sc] 没有可用的 EGL display\n");
@@ -894,13 +1013,14 @@ struct ww_sc *ww_sc_create(struct wl_display *dpy, struct wl_output *output,
     }
     ww_sc_set_fps(s, fps > 0 ? fps : 60);
 
-    /* 零拷贝后端依赖 NVIDIA 的 EGL，glvnd 默认可能先枚举到集显 */
-    if (!getenv("__EGL_VENDOR_LIBRARY_FILENAMES")) {
+    /* 强制厂商库只对 NVIDIA 抓帧有意义：glvnd 被锁成 nvidia-only 后，
+       Mesa 的 i915/iris 设备根本不会被枚举到，集显路径永远建不出同卡上下文。 */
+    if (!getenv("__EGL_VENDOR_LIBRARY_FILENAMES") && node_is_nvidia(gbm_node)) {
         setenv("__EGL_VENDOR_LIBRARY_FILENAMES",
                "/usr/share/glvnd/egl_vendor.d/10_nvidia.json", 1);
     }
 
-    if (init_egl_gl(s) != 0) {
+    if (init_egl_gl(s, gbm_node) != 0) {
         goto fail;
     }
 

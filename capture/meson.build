@@ -9,6 +9,8 @@ wl_dep  = dependency('wayland-client')
 gbm_dep = dependency('gbm')
 drm_dep = dependency('libdrm')
 va_dep  = dependency('libva')
+# vaGetDisplayDRM（目标码率能力探测用 vaInitialize 查询码控属性）
+va_drm_dep = cc.find_library('va-drm')
 xkb_dep = dependency('xkbcommon')
 avcodec_dep = dependency('libavcodec')
 avutil_dep  = dependency('libavutil')
@@ -49,7 +51,7 @@ endif
 
 executable('wwcap',
   ['src/main.c', 'src/encoder_vaapi.c', 'src/input.c', 'src/capture_shm.c', 'src/audio.c', 'src/yuv_shim.cc'] + extra_src + gen_src,
-  dependencies: [wl_dep, gbm_dep, drm_dep, va_dep, xkb_dep, avcodec_dep, avutil_dep, swscale_dep, threads_dep, yuv_dep, pipewire_dep, opus_dep] + extra_deps,
+  dependencies: [wl_dep, gbm_dep, drm_dep, va_dep, va_drm_dep, xkb_dep, avcodec_dep, avutil_dep, swscale_dep, threads_dep, yuv_dep, pipewire_dep, opus_dep] + extra_deps,
   include_directories: inc,
   c_args: (yuv_dep.found() ? ['-DHAVE_LIBYUV'] : []) + extra_args,
   install: false,

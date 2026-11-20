@@ -158,7 +158,9 @@ env -u LD_LIBRARY_PATH node scripts/perf-test.mjs 9224
 | MAN-INPUT-03 | 画布外操作 | 真实浏览器 | 光标移出画面/移入黑边 | 不发 `pm`，不发生坐标 clamp 到边缘 | [input.js](../web/src/input.js) 的 `#flush` |
 | MAN-INPUT-04 | 失焦释放按键 | 真实浏览器 | 按住 Shift/方向键时切走窗口 | 远端按键全部释放，不出现「粘键」 | [input.js](../web/src/input.js) 的 `releaseAll` |
 | MAN-INPUT-05 | CapsLock / 修饰键 | 真实浏览器 | 按 CapsLock 后输入字母 | 大小写状态正确，失焦恢复后不残留 | [input.c](../capture/src/input.c) 的 `locked` |
-| MAN-INPUT-06 | 屏幕上只有一支光标 | 真实浏览器 | 在视频区域内移动、点击 | 只有视频里 compositor 渲染的光标，没有第二支自绘箭头 | [input.js](../web/src/input.js) 顶部注释；[main.css](../web/styles/main.css) 的 `#screen { cursor: none }` |
+| MAN-INPUT-06 | 屏幕上只有一支光标 | 真实浏览器 | 在视频区域内移动、点击 | **2026-11-20 起反转**：视频里已经没有光标（服务端透明主题），只有客户端自绘的 SVG 箭头；若看到两支说明 `/capabilities` 的 `cursor` 与实际主题不一致 | [main.js](../web/src/main.js) 的 `enableLocalCursor`；`config/hypr/hyprland.conf` 的 `enable_hyprcursor=false` |
+| MAN-INPUT-07 | 本地光标延迟 | 真实浏览器 | 快速拖动鼠标 | 箭头立即跟手（不再有 26~50ms 拖影）；移出画布即隐藏、交还系统光标 | `#cursor-local` + `input.js` 的 `onPointer`；追踪报告「光标可见延迟」应 ≈0 |
+| MAN-INPUT-08 | 抓帧里确实没有光标 | 服务器本地 | `grim -o HEADLESS-2` 在指针两个不同位置各截一帧 | 两帧**差异像素为 0**（有光标时约 150px/位置）| `hyprctl setcursor` 运行时不生效，必须 `XCURSOR_THEME` + 重启会话 |
 
 > 多鼠标说明：Hyprland 是单光标模型，宿主机物理鼠标与串流指针共用同一光标，
 > 因此「多个鼠标互不干扰」目前定义为**多客户端输入归属隔离**（CONN-05），非独立光标。
