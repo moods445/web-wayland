@@ -54,5 +54,6 @@ native/wwclient
 native/wwsrc
 
 
-bugs/
+# 本地 bug 草稿目录：只放指针，不入库；正式 bug 文档在 docs/bugs/（需跟踪）
+/bugs/
 

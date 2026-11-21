@@ -1,7 +1,7 @@
 # web-wayland 项目完整汇总
 
 > 本文是整个项目从需求提出到当前的完整汇总：诉求演进、系统架构、全部文件改动、全部 bug 修复、性能实测、测试工具、当前状态与待决策事项。
-> 聚焦某主题时可转阅：`README.md`（上手/部署）、`docs/architecture.md`（架构/踩坑基线）、`docs/streaming-conclusions.md`（最新一轮结论与 4K60 分析）、`docs/sunshine-moonlight.md`（**当前部署**：Sunshine + Moonlight）。
+> 聚焦某主题时可转阅：`README.md`（上手/部署）、`docs/architecture.md`（架构/踩坑基线）、`docs/streaming-conclusions.md`（最新一轮结论与 4K60 分析）、`docs/sunshine-moonlight.md`（**当前部署**：Sunshine + Moonlight）、`docs/bugs/`（未修复缺陷清单）。
 
 > **2026-11-21 部署变更（当前形态）**
 > 本机改为 **Sunshine-only 串流主机**：Moonlight 作为客户端，Sunshine 作为服务端；自建的浏览器链路
@@ -13,7 +13,7 @@
 > 抓帧失败 0、X11 进程 0）。
 > 当前形态、开机行为、分辨率切换、已修复的坑、排障手册全部在
 > [docs/sunshine-moonlight.md](sunshine-moonlight.md)；唯一遗留 bug（独显虚拟输出抓帧）在
-> [bugs/sunshine-nvidia-black-screen.md](../bugs/sunshine-nvidia-black-screen.md)。
+> [bugs/sunshine-nvidia-black-screen.md](bugs/sunshine-nvidia-black-screen.md)。
 
 ---
 

@@ -388,7 +388,7 @@ SDL_VIDEODRIVER=offscreen ./wwclient --size 1920x1080 --no-vsync --dump-gl /tmp/
 | MAN-S4 | 纯 Wayland | `pgrep -a 'Xorg\|Xwayland'`；`systemctl --user show-environment \| grep -i display` | 两条都为空（`xwayland.enabled=false`、`DISPLAY` 已 unset） |
 | MAN-S5 | X11 自启已关 | `systemctl is-enabled sddm x11-common`；`systemctl --user list-unit-files \| grep lxqt` | 前者 masked；后者 `app-lxqt-*@autostart` 全部 masked |
 | MAN-S6 | 分辨率切换 | `scripts/sunshine-wayland.sh mode 2560x1440 1`（再切回 `1920x1080 1`） | 新 `HEADLESS-N` 直接是 2560x1440；旧输出被删；Sunshine 自动重启；`monitors.conf` 名字同步 |
-| MAN-S7 | 独显守卫 | `scripts/switch-display.sh nvidia 3840x2160 2` → `scripts/sunshine-wayland.sh status` | Sunshine **拒绝启动**（未修复 bug，见 `bugs/sunshine-nvidia-black-screen.md`），`doctor` 给出原因；切回 `intel 1920x1080 1` 恢复 |
+| MAN-S7 | 独显守卫 | `scripts/switch-display.sh nvidia 3840x2160 2` → `scripts/sunshine-wayland.sh status` | Sunshine **拒绝启动**（未修复 bug，见 `docs/bugs/sunshine-nvidia-black-screen.md`），`doctor` 给出原因；切回 `intel 1920x1080 1` 恢复 |
 | MAN-S8 | 浏览器链路已停 | `systemctl --user is-enabled ww-cap ww-gateway`；`pgrep -a 'wwcap\|wwgw'` | disabled；无进程 |
 | MAN-S9 | 字号档位生效 | `scripts/font-scale.sh status` | GTK=1.3；waybar 16px/高 46；fuzzel 14pt；foot 18px；光标 31px；输出 scale=1.0 |
 | MAN-S10 | 画面未缩放（不糊） | `grim -o HEADLESS-2 /tmp/s.png`，1:1 查看；`scripts/font-scale.sh status` 第 7 行 | PNG 恰为 1920×1080；文字笔画 1px 级过渡（无 2×2 重复像素块）；无 `GDK_SCALE`/`QT_SCALE_FACTOR` |

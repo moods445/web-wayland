@@ -24,7 +24,7 @@
 - **切换靠脚本**：GPU（集显/独显）与分辨率/缩放统一用 `scripts/switch-display.sh`。
 
 相关文档：自建链路的实测与优化见 [streaming-conclusions.md](streaming-conclusions.md)；
-NVIDIA 黑屏的完整排查过程见 [../bugs/sunshine-nvidia-black-screen.md](../bugs/sunshine-nvidia-black-screen.md)。
+NVIDIA 黑屏的完整排查过程见 [bugs/sunshine-nvidia-black-screen.md](bugs/sunshine-nvidia-black-screen.md)。
 
 ## 1. 前置条件
 
@@ -407,13 +407,13 @@ Wayland 侧的 eDP-1 又会退化成 `0x0`，两者不要同时用。
   在 `hyprland.conf` 里用 `source` 引入；`SUPER+SHIFT+D` 打开设置界面
 - `~/.config/sunshine/sunshine.log`：服务端日志（抓帧/编码/连接/延迟）
 - `~/.config/sunshine/sunshine_state.json`：Web UI 账号与已配对设备
-- [bugs/sunshine-nvidia-black-screen.md](../bugs/sunshine-nvidia-black-screen.md)：**仍未修复**的独显虚拟输出抓帧缺陷（唯一遗留 bug）
+- [bugs/sunshine-nvidia-black-screen.md](bugs/sunshine-nvidia-black-screen.md)：**仍未修复**的独显虚拟输出抓帧缺陷（唯一遗留 bug）
 - [docs/streaming-conclusions.md](streaming-conclusions.md)：项目自有链路的性能结论与优化记录（历史）
 
 ## 11. 已修复的坑（2026-11-21）
 
 这一轮把「Moonlight 连上全黑」彻底拆开修完了，记录在此备查（只剩独显虚拟输出那条属于上游缺陷，
-见 [bugs/sunshine-nvidia-black-screen.md](../bugs/sunshine-nvidia-black-screen.md)）。
+见 [bugs/sunshine-nvidia-black-screen.md](bugs/sunshine-nvidia-black-screen.md)）。
 
 | 症状 | 根因 | 修法 |
 |---|---|---|
