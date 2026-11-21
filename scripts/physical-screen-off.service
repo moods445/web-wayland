@@ -1,0 +1,18 @@
+[Unit]
+Description=强制禁用物理屏 eDP-1 的桌面渲染（防 safe-mode 点亮面板）
+# ww-session 每次启动/重启（含 watchdog 的 safe-mode 重启）后都要重新注入，
+# 所以做成 oneshot 单元：ww-session 通过 Wants 带起它，PartOf 让它跟随会话重启。
+# 另配 physical-screen-off.timer 每 10 秒兜底——因为 safe-mode 是 start-hyprland
+# 内部 watchdog 重启 Hyprland 子进程，systemd 单元本身不重启，Wants/PartOf 覆盖不到。
+# 本单元只作用于 Hyprland 桌面输出，不碰 getty/tty 文本控制台。
+
+[Service]
+Type=oneshot
+Environment=LD_LIBRARY_PATH=
+# @PHYSICAL_SCREEN_SCRIPT@ 由 scripts/install-sunshine-host.sh 安装时替换为本机绝对路径
+ExecStart=/usr/bin/bash @PHYSICAL_SCREEN_SCRIPT@ ensure-off
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

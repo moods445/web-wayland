@@ -123,17 +123,22 @@ fi
 
 # ── 3. 安装用户单元 ────────────────────────────────────────────────────────
 mkdir -p "$UNIT_DIR"
-for u in "$SESSION" "$SUN"; do
+for u in "$SESSION" "$SUN" physical-screen-off.service physical-screen-off.timer; do
     install -m 644 "$ROOT/scripts/$u" "$UNIT_DIR/$u"
     log "已安装 $UNIT_DIR/$u"
 done
+# physical-screen-off.service 里的脚本路径占位符替换为仓库内脚本的绝对路径
+# （sed 分隔符用 |，避免路径里的 / 冲突）
+sed -i "s|@PHYSICAL_SCREEN_SCRIPT@|$ROOT/scripts/physical-screen.sh|g" \
+    "$UNIT_DIR/physical-screen-off.service"
 systemctl --user daemon-reload
 
 # 无图形登录也要常驻：linger
 loginctl enable-linger "$(id -un)" 2>/dev/null || true
 
 systemctl --user enable "$SESSION" "$SUN" >/dev/null
-log "已启用开机自启：$SESSION + $SUN"
+systemctl --user enable physical-screen-off.timer >/dev/null
+log "已启用开机自启：$SESSION + $SUN + physical-screen-off.timer"
 
 # ── 4. 启动/重启 ──────────────────────────────────────────────────────────
 if [ "$RESTART_SESSION" = 1 ]; then

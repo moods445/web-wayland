@@ -1,0 +1,12 @@
+[Unit]
+Description=兜底：每 10 秒确认物理屏 eDP-1 的桌面渲染被禁用
+# 覆盖 safe-mode 场景：watchdog 在 start-hyprland 内部重启 Hyprland 子进程，
+# systemd 层看不到单元重启，Wants/PartOf 钩子不会触发；timer 周期性检查并纠正。
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=10s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

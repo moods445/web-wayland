@@ -1,5 +1,8 @@
 [Unit]
 Description=Hyprland 桌面会话（Moonlight/Sunshine 抓帧目标）
+# 会话起来后立刻强制禁用物理屏桌面（safe-mode 的 stub 配置不含 eDP-1 禁用规则）。
+# 周期兜底另见 physical-screen-off.timer（覆盖 start-hyprland 内部 watchdog 重启）。
+Wants=physical-screen-off.service
 
 [Service]
 Type=simple

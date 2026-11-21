@@ -328,7 +328,21 @@ export DISPLAY=:1 QT_QPA_PLATFORM=xcb
 
 ## 8. 故障排查
 
-**第一件事永远是 `scripts/sunshine-wayland.sh doctor`**：它一次打印会话/输出/dpms、dmabuf 主设备与驱动、
+**第一件事跑 `scripts/doctor.sh`**（全量体检，2026-11-21 新增）：覆盖下面故障表的**所有**已知问题，
+逐条打印 `[ OK ]/[WARN]/[FAIL]` 并给出「原因 + 解决步骤」，末尾汇总修复动作。
+- `scripts/doctor.sh`          只读体检，不改系统；
+- `scripts/doctor.sh --fix`    体检后按检测顺序自动执行修复（重启会话/服务、切 GPU 等会关窗口的动作有标注）；
+- `scripts/doctor.sh --help`   查看用法。
+
+它比旧的 `scripts/sunshine-wayland.sh doctor` 多覆盖：safe-mode 会话、eDP-1 未禁用、多输出同坐标重叠、
+桌面是否真在画（grim 截图判黑）、虚拟输出缺失/多余、配对状态（`named_devices`）、wwcap 双抓帧、
+input 组、监听端口等；旧的 `doctor` 保留不变，可作快速自检。
+
+> 实测：`doctor.sh` 会识别「safe-mode 会话」这一旧 `doctor` 误判为「环境正常」的黑屏根因——
+> watchdog 用 `recoverycfg.conf` 拉起后物理屏 eDP-1 被点亮、无壁纸/waybar，screencopy 抓错层导致全黑；
+> `--fix` 会重启 `ww-session` 退出安全模式并重建 `sunshine-wayland`，复查应 `FAIL=0`。
+
+**旧的快速自检**：`scripts/sunshine-wayland.sh doctor` 一次打印会话/输出/dpms、dmabuf 主设备与驱动、
 `sunshine.conf`、进程环境（有没有 `WAYLAND_DISPLAY`、有没有残留 `DISPLAY`）、抓帧失败帧数、
 Hyprland 侧 `EGL_BAD_PARAMETER` 计数、相关服务状态，最后给一句结论。
 
@@ -381,7 +395,8 @@ Wayland 侧的 eDP-1 又会退化成 `0x0`，两者不要同时用。
 
 ## 10. 相关文件
 
-- [scripts/sunshine-wayland.sh](../scripts/sunshine-wayland.sh)：起停 + 自动探测 + `doctor`（本文所有配置动作都在这里）
+- [scripts/doctor.sh](../scripts/doctor.sh)：**全量体检**——检测所有已知黑屏/串流问题，逐条给原因与解决步骤，`--fix` 可自动修复（见 §8）
+- [scripts/sunshine-wayland.sh](../scripts/sunshine-wayland.sh)：起停 + 自动探测 + 快速 `doctor`（本文所有配置动作都在这里）
 - [scripts/sunshine-wayland.service](../scripts/sunshine-wayland.service)：Sunshine 用户单元（`PartOf=ww-session`）
 - [scripts/install-sunshine-host.sh](../scripts/install-sunshine-host.sh)：一键切到 Sunshine-only 部署
 - [scripts/font-scale.sh](../scripts/font-scale.sh)：字号档位（1.0/1.15/1.3/1.45）+ 清晰度自检（见 §12）
@@ -487,3 +502,97 @@ hyprctl layers -j | grep -A3 '"waybar"'   # 栏高应为 12.3 表里的值（1.3
 - 「`foot` 还是小字」→ 已开的终端不会热更新，关掉重开。
 - 光标变大后**必须重启会话**（`systemctl --user restart ww-session`），环境变量只在启动时读。
 - 不要再用 `mode ... 2` 去「顺手放大」——那会把逻辑分辨率砍半，回到 960×540。
+
+## 13. 物理屏 eDP-1 与 safe-mode
+
+### 13.1 什么是 safe-mode（安全模式）
+
+safe-mode 是 **Hyprland 的崩溃保护机制**：上一个会话异常崩溃后，watchdog 用 `--safe-mode` 拉起新会话，
+此时**不加载正式配置** `~/.config/hypr/hyprland.conf`，而是加载一份自动生成的 stub
+`$XDG_RUNTIME_DIR/hypr/<sig>/recoverycfg.conf`（只有几个默认快捷键，无 `monitor` 规则、无壁纸/waybar）。
+
+后果（正是 2026-11-21 黑屏那个坑）：
+- 物理屏 eDP-1 被**默认点亮**（stub 里没有 `monitor = eDP-1, disable`）；
+- 没有壁纸/waybar/自定义键位；
+- headless 输出可能缺失或与 eDP-1 重叠 → screencopy 抓错层 → Moonlight 全黑。
+
+识别：`pgrep -af 'Hyprland.*--safe-mode'`，或 `scripts/doctor.sh` 第 1 节直接报 `[FAIL] safe-mode`。
+恢复：`systemctl --user restart ww-session`（重启用正式配置，回到正常模式）。
+
+### 13.2 永久禁止物理屏点亮桌面（控制台不受影响）
+
+桌面只存在于 headless 虚拟输出；物理面板 eDP-1 平时 `disable`、保持黑屏。为防止 safe-mode 把面板点亮，
+部署了三层保险（均由 `scripts/install-sunshine-host.sh` 自动安装/启用）：
+
+| 层 | 机制 | 覆盖场景 |
+|---|---|---|
+| 1 | `hyprland.conf` 的 `monitor = eDP-1, disable` | 正常会话启动 |
+| 2 | `ww-session.service` 的 `Wants=physical-screen-off.service` + `PartOf` | 会话经 systemd 重启时立即注入禁用 |
+| 3 | `physical-screen-off.timer` 每 10s 跑一次 `physical-screen.sh ensure-off` | **兜底**：safe-mode 是 start-hyprland 内部 watchdog 重启子进程、systemd 层看不到，只能靠周期检查 |
+
+`ensure-off` 的禁用逻辑（`disable_panel`）：先试 `hyprctl keyword monitor eDP-1,disable`，没生效就 `hyprctl reload`
+应用正式配置；safe-mode 下 reload 的是 stub（无 disable 规则），则往 stub 追加 `monitor = eDP-1, disable` 再 reload。
+注意：`keyword ... disable` 对「已运行期点亮」的输出返回 `ok` 但实际不生效，必须 reload。
+
+> 只禁用 **Hyprland 往 eDP-1 渲染桌面**，不碰 getty/tty 文本控制台（`Ctrl+Alt+F2` 仍可用）。
+> `Ctrl+Alt+F2` 到 tty 后 `startx`/`Xorg` 之类能否用是另一回事，本方案不 disable 任何控制台服务。
+
+### 13.3 临时点亮物理屏看桌面
+
+```bash
+scripts/physical-screen.sh status        # 看 eDP-1 / headless 当前状态
+scripts/physical-screen.sh on            # 点亮物理屏（默认 5 分钟，timer 在持有期内不关它）
+scripts/physical-screen.sh on 10         # 点亮 10 分钟
+scripts/physical-screen.sh off           # 立即恢复禁用（清掉持有期）
+```
+
+- 物理屏用 `preferred`（eDP-1 原生 3840x2160，只有这一档 availableModes；写 1920x1080 会被 modeset 后回退禁用，
+  **点了不亮**）；可用 `WW_PANEL_MODE=1920x1080@60` 覆盖。
+- 物理屏放在 headless **右侧**（避免同坐标 `0x0` 重叠让 screencopy 抓错层导致 Moonlight 黑屏）。
+- 这是运行期改动，重启 `ww-session` 后自动恢复禁用；`timer` 也会在持有期（默认 5 分钟）到点后自动恢复。
+
+相关文件：`scripts/physical-screen.sh`、`scripts/physical-screen-off.service`、`scripts/physical-screen-off.timer`、
+`scripts/ww-session.service`（`Wants=`）、`scripts/install-sunshine-host.sh`（安装/启用）。
+
+## 14. Hyprland 崩溃诊断（2026-11-21）
+
+### 14.1 结论
+
+崩溃**不是配置写错**，而是 Hyprland v0.55.2 + Aquamarine 0.11 在 headless 输出 + 集显 GL 渲染路径的
+**偶发上游缺陷**；正式配置能稳定运行数小时。可疑触发场景：Moonlight 虚拟 HID 设备热插拔、
+eDP-1 4K modeset 与 headless 渲染的 page-flip 竞争。
+
+### 14.2 证据
+
+崩溃报告（`~/.cache/hyprland/hyprlandCrashReport*.txt`，8 份，mtime 11-18 ~ 11-20，Tag v0.55.2）：
+
+| 时间 | 报告 | 信号 | 提示 | 关键堆栈帧 |
+|---|---|---|---|---|
+| 11-20 22:34 | 425279 | 11 SEGV | "We've got an imposter in the code!" | `Cursor::CShapeOverrideController::unsetOverride` |
+| 11-20 20:50 | 300714 | 6 ABRT | "Who tried dividing by zero?!"（除零） | — |
+| 11-19 00:25 | 363035 | 6 ABRT | "dusting your PC" | `Render::GL::CHyprOpenGLImpl::begin` |
+| 11-19 00:01 | 350595 | 6 ABRT | 除零 | `Render::GL::CHyprOpenGLImpl::begin` |
+| 11-18~19 其余 | 5 份 | 6 ABRT | "Oops" / "stable" | — |
+
+共同调用栈：`CHyprOpenGLImpl::begin` → `beginRenderInternal` → `renderMonitor` →
+`CMonitorFrameScheduler::onFrame` → `Aquamarine::CHeadlessBackend::dispatchTimers`（headless 帧调度/GL 渲染）。
+
+11-21 两次进入 safe-mode（10:35、13:19）**没有新报告**——单元设了 `HYPRLAND_NO_CRASHREPORTER=1`
+（只关报告生成，不关 safe-mode）。其 `hyprland.log` 的错误是 `drm: Cannot commit when a page-flip is awaiting`，
+日志末尾都是 `libvirtualhid Keyboard/Mouse: device removed`。内核日志无 segfault/OOM 记录。
+大量 `wl_display_connect failed` / `DRM Backend failed` 是嵌套/重复启动失败，属排障期的手工重启，不是崩溃。
+
+### 14.3 为什么 safe-mode 会出现、以及为何仍保留 watchdog
+
+`/usr/bin/start-hyprland` 是 watchdog：Hyprland 非正常退出时它重启子进程，并在上次崩溃后加 `--safe-mode`
+（strings 可见 `Hyprland exit not-cleanly, restarting`）。Hyprland 本体**没有**"崩溃后用正式配置重启"的开关
+（只有 `--safe-mode` 启用项，`HYPRLAND_NO_CRASHREPORTER` 只管报告）。
+
+**当前决定：不启用崩溃自恢复改造**（2026-11-21）。保留 `start-hyprland` watchdog 的活锁自愈能力，
+接受偶发 safe-mode；其副作用（物理屏点亮、串流抓错层）已由 §13 的三层保险兜底，
+`scripts/doctor.sh` 可识别并提示恢复。
+
+备选方案（未启用，留作需要时实施）：把 `ww-session.service` 的 `ExecStart` 改为直接
+`/usr/bin/Hyprland --config %h/.config/hypr/hyprland.conf`，由 systemd `Restart=on-failure` 用正式配置重启，
+彻底跳过 safe-mode；代价是失去 watchdog 对"进程存活但无响应"的自愈，需加 `StartLimitBurst` 防重启风暴。
+启用后可用 `hyprctl keyword debug:manual_crash 1`（再置 0）受控触发一次崩溃验证。
