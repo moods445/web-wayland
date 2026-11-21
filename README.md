@@ -15,7 +15,8 @@ scripts/install-sunshine-host.sh --restart-session  # 连桌面一起重启（�
 ## 客户端连接
 
 1. Moonlight「添加主机」，填本机 IP（当前 `192.168.0.109`，mDNS 未启用）。
-2. 浏览器打开 `https://<IP>:47990`（自签证书需信任），用 Moonlight 显示的 PIN 配对。
+2. 浏览器打开 `https://<IP>:47990`（自签证书需信任），用默认账号 `sunshine` / `sunshine` 登录，
+   再用 Moonlight 显示的 PIN 配对。
 3. 选择 `Desktop` 开始串流。
 
 ## 日常使用

@@ -88,10 +88,14 @@ systemd user manager（linger=yes，无人登录也拉起）
 客户端侧还有两件服务端代替不了的事：
 
 1. Moonlight 里**添加过一次主机**（IP `192.168.0.109`，mDNS 不一定通）；
-2. **配对**：`https://192.168.0.109:47990` 登录 → 输入 Moonlight 显示的四位 PIN。
+2. **配对**：`https://192.168.0.109:47990` 用默认账号 `sunshine` / `sunshine` 登录 → 输入 Moonlight 显示的四位 PIN。
    配对结果写在 `~/.config/sunshine/sunshine_state.json` 的 `named_devices`。
    本机当前 `named_devices: 0`（还没有配对设备），所以重启后第一次连之前**先配一次对**，
    之后就不用再配。
+
+   > 默认凭据由 `scripts/install-sunshine-host.sh` 在首次安装时通过
+   > `sunshine --creds sunshine sunshine` 写入；已有账号不会被覆盖。要改密码：先
+   > `systemctl --user stop sunshine-wayland.service`，再 `sunshine --creds sunshine <新密码>`，最后重启服务。
 
 `sunshine_name = debian-server-x11` 是配置里遗留的名字，只影响 Moonlight 列表里的显示名，
 不影响连接（想改就改 `sunshine.conf`）。
@@ -269,7 +273,7 @@ env -u DISPLAY XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 \
    > 按 IP 手动添加即可（想要自动发现：`sudo systemctl enable --now avahi-daemon`）。
    > 主机加过一次就会保存在客户端，重启服务器后直接点它连。
 2. 客户端会显示 4 位 PIN，浏览器打开 `https://<IP>:47990`（自签证书，需手动信任），
-   登录后在 PIN 输入框提交完成配对。首次用可在同一页面设置 Web UI 账号密码。
+   用默认账号 `sunshine` / `sunshine` 登录，在 PIN 输入框提交完成配对（改密码见 §1.2）。
 3. 选择 `Desktop` 开始串流。应用列表来自 `~/.config/sunshine/apps.json`
    （`Desktop` / `Low Res Desktop` / `Steam Big Picture`）。
 
@@ -409,7 +413,7 @@ Wayland 侧的 eDP-1 又会退化成 `0x0`，两者不要同时用。
 - `~/.config/hypr/monitors.conf`：显示器布局（分辨率/位置/缩放），由 nwg-displays 导出，
   在 `hyprland.conf` 里用 `source` 引入；`SUPER+SHIFT+D` 打开设置界面
 - `~/.config/sunshine/sunshine.log`：服务端日志（抓帧/编码/连接/延迟）
-- `~/.config/sunshine/sunshine_state.json`：Web UI 账号与已配对设备
+- `~/.config/sunshine/sunshine_state.json`：Web UI 账号（默认 `sunshine` / `sunshine`，用 `sunshine --creds` 修改）与已配对设备
 - [bugs/sunshine-nvidia-black-screen.md](bugs/sunshine-nvidia-black-screen.md)：**仍未修复**的独显虚拟输出抓帧缺陷（唯一遗留 bug）
 
 ## 11. 已修复的坑（2026-11-21）

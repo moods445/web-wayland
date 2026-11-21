@@ -17,6 +17,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SUN_STATE="${XDG_CONFIG_HOME:-$HOME/.config}/sunshine/sunshine_state.json"
 DISTRO_UNIT=app-dev.lizardbyte.app.Sunshine.service
 SESSION=ww-session.service
 SUN=sunshine-wayland.service
@@ -140,7 +141,19 @@ systemctl --user enable "$SESSION" "$SUN" >/dev/null
 systemctl --user enable physical-screen-off.timer >/dev/null
 log "已启用开机自启：$SESSION + $SUN + physical-screen-off.timer"
 
-# ── 4. 启动/重启 ──────────────────────────────────────────────────────────
+# ── 4. Web UI 默认凭据（仅首次初始化，不覆盖已有账号）─────────────────────
+if [ -f "$SUN_STATE" ]; then
+    log "保留现有 Sunshine Web UI 账号（$SUN_STATE）"
+else
+    systemctl --user stop "$SUN" 2>/dev/null || true
+    if sunshine --creds sunshine sunshine >/dev/null; then
+        log "已写入 Sunshine Web UI 默认账号：sunshine / sunshine"
+    else
+        warn "写入 Sunshine Web UI 默认账号失败，请首次打开 https://<IP>:47990 时按提示设置"
+    fi
+fi
+
+# ── 5. 启动/重启 ──────────────────────────────────────────────────────────
 if [ "$RESTART_SESSION" = 1 ]; then
     log "重启会话与 Sunshine（桌面里的窗口会被关掉）"
     systemctl --user restart "$SESSION"
