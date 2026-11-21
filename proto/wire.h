@@ -19,7 +19,7 @@
 #define WW_MAX_PAYLOAD 1100
 #define WW_VID_HDR_SIZE 24
 
-/* 视频分片头 —— 24 字节，与 web/src/proto.js 保持一致 */
+/* 视频分片头 —— 24 字节（历史自建链路协议，已无使用者）*/
 struct ww_vid_frag_hdr {
     uint8_t  version;      /* = WW_WIRE_VERSION */
     uint8_t  flags;        /* bit0 关键帧, bit1 首片, bit2 末片 */
@@ -28,7 +28,7 @@ struct ww_vid_frag_hdr {
     uint16_t frag_index;
     uint16_t frag_count;
     uint32_t payload_len;
-    uint64_t pts_us;   /* offset 16，与 web/src/proto.js 一致 */
+    uint64_t pts_us;   /* offset 16 */
 } __attribute__((packed));
 
 #define WW_FRAG_KEY       0x01
@@ -70,7 +70,7 @@ struct ww_vid_frag_hdr {
 #define WW_AUDIO_FRAME_SAMPLES 960          /* 48000 * 20 / 1000 */
 #define WW_AUDIO_BITRATE 64000              /* 立体声总码率 */
 
-/* 音频包 —— 16 字节，与 web/src/proto.js 保持一致 */
+/* 音频包 —— 16 字节（历史自建链路协议，已无使用者）*/
 struct ww_aud_hdr {
     uint8_t  version;    /* = WW_AUDIO_VERSION */
     uint8_t  flags;      /* bit0 主帧有效, bit1 冗余帧有效 */

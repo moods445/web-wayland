@@ -1,7 +1,7 @@
 # Sunshine + Moonlight 部署（2026-11-20，2026-11-21 起为本机唯一串流路径）
 
-本机现在**只做 Moonlight + Sunshine 串流主机**：自建的浏览器链路（wwcap + wwgw + web）
-已经停用并取消开机自启（代码保留，随时可回到 `scripts/install-services.sh`）。
+本机**只做 Moonlight + Sunshine 串流主机**，桌面是 Hyprland/Wayland 会话。
+早期自建的浏览器链路已整体删除，仓库只保留当前这套方案。
 本文记录怎么起、为什么这么起、实测到什么程度、坏了怎么查。
 
 结论先行：
@@ -23,7 +23,7 @@
 - **只用虚拟输出**：物理屏 eDP-1 在配置里 `disable`（黑屏、不参与布局），桌面只存在于 headless 输出；
 - **切换靠脚本**：GPU（集显/独显）与分辨率/缩放统一用 `scripts/switch-display.sh`。
 
-相关文档：自建链路的实测与优化见 [streaming-conclusions.md](streaming-conclusions.md)；
+相关文档：项目当前形态与简短背景见 [PROJECT-SUMMARY.md](PROJECT-SUMMARY.md)；
 NVIDIA 黑屏的完整排查过程见 [bugs/sunshine-nvidia-black-screen.md](bugs/sunshine-nvidia-black-screen.md)。
 
 ## 1. 前置条件
@@ -36,7 +36,6 @@ NVIDIA 黑屏的完整排查过程见 [bugs/sunshine-nvidia-black-screen.md](bug
 | X11 | **纯 Wayland，不再用 X11**：`sddm` / `x11-common` 已 mask，Hyprland 的 `xwayland.enabled = false`，LXQt 的 X11 自启单元已 mask（见 §1.1） |
 | Sunshine | `sunshine` 在 PATH（本机为 Debian trixie 包，2026.914.233613） |
 | 用户组 | `aio` 需在 `input` 组（`usermod -aG input aio`），否则键鼠注入不生效（脚本会退化成 `sg input` 启动） |
-| 互斥 | 浏览器链路已停用：`ww-cap`/`ww-gateway` 已 `disable`。**不要手工再起 wwcap**，两者都抢 screencopy，双抓帧会把帧率打对折 |
 | 发行版单元 | `app-dev.lizardbyte.app.Sunshine.service` 必须被 mask 掉（见 §3.3），它会用 X11 环境抢端口 |
 
 ### 1.1 纯 Wayland（2026-11-21 起，X11 全部关闭）
@@ -124,7 +123,7 @@ scripts/sunshine-wayland.sh mode 1920x1080 1    # 当前默认（物理 1080p、
 
 ```bash
 # 0) 一键切到「只做 Moonlight/Sunshine 主机」：
-#    停用 ww-cap/ww-gateway、mask 发行版 Sunshine 单元、安装并启用下面两个用户单元
+#    mask 发行版 Sunshine 单元、安装并启用下面两个用户单元
 scripts/install-sunshine-host.sh                  # 不动正在跑的会话
 scripts/install-sunshine-host.sh --restart-session # 连桌面一起重启（应用新环境变量，窗口会关掉）
 
@@ -225,8 +224,7 @@ Moonlight 连上就黑屏（2026-11-21 现场就是这个状态，`sunshine.log`
 | 动作 | 对象 | 原因 |
 |---|---|---|
 | `disable --now` + `mask` | `app-dev.lizardbyte.app.Sunshine.service`（user） | 环境错，且会抢先占住 47984-47990 |
-| `disable --now` | `ww-cap` / `ww-gateway` | 浏览器链路停用；wwcap 与 Sunshine 抢 screencopy |
-| 安装 + `enable` | `ww-session` | Hyprland 桌面（抓帧目标），新单元去掉了透明光标环境变量 |
+| 安装 + `enable` | `ww-session` | Hyprland 桌面（抓帧目标），单元里不带透明光标环境变量 |
 | 安装 + `enable` | `sunshine-wayland` | 本项目的 Sunshine 单元，`PartOf=ww-session`，会话重建跟着重建 |
 
 `loginctl enable-linger` 保持开启，否则开机没人登录时用户单元不会启动。
@@ -299,7 +297,7 @@ export DISPLAY=:1 QT_QPA_PLATFORM=xcb
 | 抓帧 | `wlr`（`zwlr_screencopy_manager_v1` v3），`[wlgrab] Monitor 1 is HEADLESS-2` |
 | 编码 | `h264_vaapi`（Intel iHD 25.2.3），RC framerate 60/1 |
 | 码率 | 14,988,000 bps（客户端请求 20 Mbps，服务端折算） |
-| 色彩 | SDR **Rec.601** / 8-bit / JPEG range（项目链路是 BT.709 + full range） |
+| 色彩 | SDR **Rec.601** / 8-bit / JPEG range |
 | 服务端帧处理延迟 | 4 分钟稳态 avg **9.7~10.1ms**；20s 窗口 min 6.9ms / max 27.2ms / avg **9.17ms** |
 | 客户端 | Moonlight 6.2.0：`Video stream is 1920x1080x60 (format 0x1)`、`Test decode successful` |
 | 会话 | `CLIENT CONNECTED` → `CLIENT DISCONNECTED` 正常，期间无 `Frame capture failed` |
@@ -309,23 +307,22 @@ export DISPLAY=:1 QT_QPA_PLATFORM=xcb
 
 ## 7. 已知限制
 
-1. **4K60 在本机不可得**。Intel 上 Hyprland 合成 4K 只有 20~22fps（见
-   [streaming-conclusions.md §9](streaming-conclusions.md)）；独显虽然能合成 4K，但 Sunshine 抓不到
-   虚拟输出（`wlr` 的 dmabuf 导出失败，`kms` 又不认 `HEADLESS` 连接器）。要 4K60 就得给独显
-   HDMI 口插 EDID 诱骗器，把输出变成真实 CRTC 后才走 `capture=kms`。
-2. **画质低一档**：Rec.601 + JPEG range + 4:2:0，桌面文字/纯色块不如项目自有的
-   BT.709 + full range + 4:4:4 链路；Sunshine 的 VAAPI 路径没有 4:4:4 选项。
-3. **与 wwcap 互斥**：同时跑会双抓帧（历史事故 58→30fps）。浏览器链路已停用，别手工起 wwcap。
-4. **输出名会变**：Hyprland 重启后 headless 输出会重建（`HEADLESS-N` 可能变）。
+1. **4K60 在本机不可得**。Intel 上 Hyprland 合成 4K 只有 20~22fps；独显虽然能合成 4K，
+   但 Sunshine 抓不到虚拟输出（`wlr` 的 dmabuf 导出失败，`kms` 又不认 `HEADLESS` 连接器）。
+   要 4K60 就得给独显 HDMI 口插 EDID 诱骗器，把输出变成真实 CRTC 后才走 `capture=kms`。
+   完整排查见 [bugs/sunshine-nvidia-black-screen.md](bugs/sunshine-nvidia-black-screen.md)。
+2. **画质受编码路径限制**：Sunshine 的 VAAPI 路径只有 Rec.601 / JPEG range / 4:2:0，
+   没有 4:4:4 选项，桌面文字/纯色块的锐度因此受限。
+3. **输出名会变**：Hyprland 重启后 headless 输出会重建（`HEADLESS-N` 可能变）。
    脚本启动时会按实际名字重放 `monitors.conf` 的档位并把名字改写进去，一般不用管；
    只有在 systemd 之外手工起 Sunshine 时才需要留意 `output_name`。
-5. **物理屏被主动禁用**：`monitor = eDP-1, disable`，面板保持黑屏，桌面只存在于 headless 输出
+4. **物理屏被主动禁用**：`monitor = eDP-1, disable`，面板保持黑屏，桌面只存在于 headless 输出
    （本地看不到，只能通过 Moonlight 看）。这是设计选择而不是故障：以前 eDP-1 停在 0x0 是因为
    Xorg/sddm 占着 DRM master 拿不到 modeset，现在已停用 sddm，改为显式禁用。
    想在本地临时看桌面：`hyprctl keyword monitor "eDP-1,1920x1080@60,0x0,1"`，用完再 `disable`。
-6. **光标在视频里**：Sunshine 的 wlr 抓帧带 `overlay_cursor`，指针是**合成器画进画面**的，
-   所以会话不能再用浏览器链路那套全透明主题 `ww-invisible`（`scripts/install-sunshine-host.sh`
-   会把 `XCURSOR_THEME` 从 `ww-session` 里去掉，`hyprland.conf` 里 `cursor:enable_hyprcursor = true`）。
+5. **光标在视频里**：Sunshine 的 wlr 抓帧带 `overlay_cursor`，指针是**合成器画进画面**的，
+   所以会话不能用已废弃的全透明光标主题 `ww-invisible`（`ww-session.service` 不设 `XCURSOR_THEME`，
+   `hyprland.conf` 里 `cursor:enable_hyprcursor = true`）。
    验证方法：`hyprctl dispatch movecursor 400 300` → `grim` → 再 `movecursor 1200 800` → `grim`，
    两张图在光标位置有差异即说明光标被画进了画面。
 
@@ -341,12 +338,11 @@ Hyprland 侧 `EGL_BAD_PARAMETER` 计数、相关服务状态，最后给一句�
 | 刚启动就连不上，日志停在版本号之后 | 进程被启动它的 shell 收走 | 必须 `setsid`（脚本已处理） |
 | 键鼠完全没反应 | `/dev/uinput` 是 `root:input 0660`，用户不在 `input` 组 | `usermod -aG input aio`；重新登录前用 `sg input -c` 启动 |
 | 屏幕黑屏/无画面 | `output_name` 与实际 headless 名不一致，或输出被销毁 | `systemctl --user restart sunshine-wayland`（脚本会重新探测并重写配置） |
-| 串流里看不到鼠标指针 | 会话还带着浏览器链路的透明光标（`XCURSOR_THEME=ww-invisible`） | `scripts/install-sunshine-host.sh --restart-session` |
+| 串流里看不到鼠标指针 | 会话错误地设了已废弃的透明光标 `XCURSOR_THEME=ww-invisible` | `scripts/install-sunshine-host.sh --restart-session` |
 | 每帧 `Frame capture failed` 且 `doctor` 显示配置 encoder 与抓帧卡不同 | 编码器跨 GPU（例如 display.state 过期导致集显会话用 nvenc） | 重启服务让脚本按实际会话重写配置 |
 | 连上但全黑，日志里 `Selected monitor []` 是正常输出 | headless 与 eDP-1 同坐标重叠（都写 `0x0`），screencopy 抓到 eDP-1 那一层 | 把 headless 移到另一个输出右侧；`hyprctl -j monitors` 确认两个输出的 `x` 不同 |
-| 多个 `HEADLESS-*` 都不存在，`hyprctl clients` 为空 | Hyprland 崩溃后 watchdog 拉起 **safe-mode** 实例，用的是 `recoverycfg.conf`（无 output 规则、无壁纸） | `scripts/switch-gpu.sh intel` 重新起正常会话 |
+| 多个 `HEADLESS-*` 都不存在，`hyprctl clients` 为空 | Hyprland 崩溃后 watchdog 拉起 **safe-mode** 实例，用的是 `recoverycfg.conf`（无 output 规则、无壁纸） | `systemctl --user restart ww-session` 重新起正常会话 |
 | `atomic drm request ... Permission denied`，eDP-1 是 `0x0` | Xorg/sddm 占着 DRM master | `sudo systemctl stop sddm`（本机已 disable），再重启 Hyprland |
-| 帧率腰斩 | 同时开了 `wwcap` | `pkill -x wwcap` 后重启 Sunshine |
 | 重启后连不上，`doctor` 提示会话是 **safe-mode**（物理屏亮起、无 waybar/壁纸） | Hyprland 崩溃后 watchdog 用 `recoverycfg.conf` 拉起 | `systemctl --user restart ww-session` |
 | `doctor` 里看到多个 `HEADLESS-*`，抓帧黑屏 | 多个虚拟输出同坐标重叠，screencopy 抓到错层 | 脚本会自动删多余的；手工删要注意**别删最后一个**（会让 Hyprland 退出） |
 | `hyprctl keyword monitor` 改分辨率返回 ok 但没变 | 虚拟输出尺寸只能在创建时定（§1.3） | `scripts/sunshine-wayland.sh mode <WxH> [scale]` |
@@ -366,17 +362,9 @@ grep -a 'libvirtualhid' /sys/class/input/*/name
 hyprctl devices | grep -a libvirtualhid
 ```
 
-## 9. 恢复与回滚
+## 9. 本机临时操作
 
-```bash
-scripts/sunshine-wayland.sh stop      # 停 Sunshine（systemd 管理时用 systemctl --user stop sunshine-wayland）
-
-# 回到项目自有的浏览器链路（当前已停用）：
-systemctl --user disable --now sunshine-wayland
-scripts/install-services.sh           # 重新安装并启用 ww-session / ww-gateway / ww-cap
-# 注意：ww-session 需要重新加回 XCURSOR_THEME=ww-invisible（浏览器端自绘光标），
-# 发行版 Sunshine 单元如需恢复：systemctl --user unmask app-dev.lizardbyte.app.Sunshine.service
-```
+停 Sunshine：`scripts/sunshine-wayland.sh stop`（systemd 管理时用 `systemctl --user stop sunshine-wayland`）。
 
 需要本地物理屏参与桌面时：
 
@@ -400,7 +388,7 @@ Wayland 侧的 eDP-1 又会退化成 `0x0`，两者不要同时用。
 - [config/foot/foot.ini](../config/foot/foot.ini)、[config/gtk-3.0/settings.ini](../config/gtk-3.0/settings.ini)：终端字号与 GTK 抗锯齿
 - [scripts/ww-session.service](../scripts/ww-session.service)：Hyprland 桌面会话（抓帧目标）
 - [scripts/switch-display.sh](../scripts/switch-display.sh)：统一切 GPU（集显/独显）与分辨率/缩放
-- [scripts/switch-gpu.sh](../scripts/switch-gpu.sh)：切换 Intel / NVIDIA 会话
+- [scripts/switch-gpu.sh](../scripts/switch-gpu.sh)：重建 Hyprland 会话到指定 GPU（被 `switch-display.sh` 调用）
 - `~/.config/hypr/display.state`：上次切到的卡（`intel`/`nvidia`），仅作参考；**编码器不再由它决定**
 - `~/.config/sunshine/sunshine.conf`：Sunshine 配置（capture/encoder/output_name/min_log_level 由脚本改写）
 - `~/.config/hypr/monitors.conf`：显示器布局（分辨率/位置/缩放），由 nwg-displays 导出，
@@ -408,7 +396,6 @@ Wayland 侧的 eDP-1 又会退化成 `0x0`，两者不要同时用。
 - `~/.config/sunshine/sunshine.log`：服务端日志（抓帧/编码/连接/延迟）
 - `~/.config/sunshine/sunshine_state.json`：Web UI 账号与已配对设备
 - [bugs/sunshine-nvidia-black-screen.md](bugs/sunshine-nvidia-black-screen.md)：**仍未修复**的独显虚拟输出抓帧缺陷（唯一遗留 bug）
-- [docs/streaming-conclusions.md](streaming-conclusions.md)：项目自有链路的性能结论与优化记录（历史）
 
 ## 11. 已修复的坑（2026-11-21）
 

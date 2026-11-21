@@ -1,22 +1,8 @@
 # 构建产物
-gateway/target/
-capture/build*/
 build/
 out/
 dist/
 node_modules/
-
-# 由脚本生成的代码/数据（见 README 快速开始）
-capture/src/generated/
-web/cert-hash.json
-
-# 证书与私钥（scripts/gen-ca.sh 生成，含私钥，切勿入库）
-certs/
-*.key
-*.pem
-*.p12
-*.pfx
-*.srl
 
 # 编译中间文件
 *.o
@@ -49,11 +35,14 @@ __pycache__/
 Thumbs.db
 .trae
 
-# 原生客户端构建产物
-native/wwclient
-native/wwsrc
-
-
 # 本地 bug 草稿目录：只放指针，不入库；正式 bug 文档在 docs/bugs/（需跟踪）
 /bugs/
+
+# 本地遗留证书与私钥（历史自建链路产物，含私钥，切勿入库）
+certs/
+*.key
+*.pem
+*.p12
+*.pfx
+*.srl
 

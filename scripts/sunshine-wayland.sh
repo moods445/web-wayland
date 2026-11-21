@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Moonlight + Sunshine 常驻服务端：起停、自检、诊断。
 #
-# 本机现在只保留 **Moonlight + Sunshine** 一条串流路径，浏览器链路（wwcap/wwgw/web）
-# 已停用（`scripts/install-sunshine-host.sh` 会关掉它们的自启）。
+# 本机只保留 **Moonlight + Sunshine** 一条串流路径，桌面抓帧交给 Sunshine。
 #
 # 用法：
 #   scripts/sunshine-wayland.sh start      # 手动起（探测环境 → 写配置 → 后台常驻）
@@ -472,8 +471,7 @@ print('   dpms=%s  currentFormat=%s' % (m.get('dpmsStatus'), m.get('currentForma
          " 失败帧=$(log_stat "$SLOG" 'Frame capture failed')"
     echo "8) Hyprland EGL 导入错误 : $(hypr_egl_errors) 条 EGL_BAD_PARAMETER"
     echo "9) 服务状态              : $SERVICE=$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)" \
-         " 发行版单元=$(distro_unit_active && echo active || echo off)" \
-         " ww-cap=$(systemctl --user is-active ww-cap 2>/dev/null || true)"
+         " 发行版单元=$(distro_unit_active && echo active || echo off)"
     local kms
     kms="$(/usr/sbin/getcap /usr/bin/sunshine 2>/dev/null | sed 's/^.*= //' || true)"
     echo "10) KMS 能力             : ${kms:-未授予（仅 capture=kms 需要：sudo setcap cap_sys_admin+p /usr/bin/sunshine）}"

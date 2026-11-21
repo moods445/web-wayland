@@ -22,7 +22,7 @@
 |---|---|
 | 桌面 | Hyprland 0.55.2（Aquamarine 0.11），仅虚拟输出 `HEADLESS-2`，物理屏 `eDP-1` 已 `disable` |
 | 显卡 | 独显 `/dev/dri/card0` = NVIDIA GTX 1050 Ti（驱动 580.178.04）；集显 `/dev/dri/card1` = i915 |
-| 会话 | `AQ_DRM_DEVICES=/dev/dri/card0`（`scripts/switch-gpu.sh nvidia`） |
+| 会话 | `AQ_DRM_DEVICES=/dev/dri/card0`（`scripts/switch-display.sh nvidia`） |
 | 输出 | `HEADLESS-2` 3840x2160@60（也试过 scale=1） |
 | Sunshine | Debian trixie 包 2026.914.233613，`capture=wlr`、`encoder=nvenc`、`output_name=HEADLESS-2`、debug 日志 |
 | 客户端 | Mac 上的 Moonlight，配对正常，能建立会话并协商出 4K 码流 |
@@ -99,7 +99,7 @@ NVIDIA 的 `eglCreateImageKHR` 不接受」，而不是驱动或桌面整体坏�
 | **独显 HDMI 口插 EDID 诱骗器（推荐）** | 几十块硬件 | 造出真实 CRTC → `capture=kms` 可用，4K60；物理屏仍可关闭（`setcap cap_sys_admin+p /usr/bin/sunshine` 需要重新加） |
 | 回集显（`scripts/switch-display.sh intel 1920x1080 1`）| 无 | **当前部署**：1080p60 稳定可用；4K 在集显上只有 ~20fps |
 | 向上游报 issue / 试用其它版本 | 时间 | 附 §5、§6 证据；关注 Aquamarine 对 nvidia screencopy dmabuf 导入的修复 |
-| 换抓帧实现 | 开发 | 给 Sunshine 加 shm 回退，或让 wwcap 抓帧后转接（工程量较大） |
+| 换抓帧实现 | 开发 | 给 Sunshine 加 shm 回退（工程量较大） |
 
 ## 9. 复现步骤
 

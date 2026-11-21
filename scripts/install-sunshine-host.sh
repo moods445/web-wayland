@@ -4,8 +4,7 @@
 #   ww-session        Hyprland 桌面（保留：Sunshine 必须有合成器才能抓帧）
 #   sunshine-wayland  Sunshine（用户单元，带正确的 Wayland 环境）
 #
-# 同时关闭浏览器链路与它们的开机自启：
-#   ww-cap / ww-gateway  停用 + 取消自启
+# 同时关闭会冲突的发行版 Sunshine 单元及其开机自启：
 #   app-dev.lizardbyte.app.Sunshine.service（发行版系统单元）
 #     在开机时以 DISPLAY=:0 / XDG_SESSION_TYPE=x11 启动，拿不到 WAYLAND_DISPLAY，
 #     抓帧必定失败 → Moonlight 黑屏。停用并 mask 掉，改由用户单元接管。
@@ -19,7 +18,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 DISTRO_UNIT=app-dev.lizardbyte.app.Sunshine.service
-RETIRED=(ww-cap.service ww-gateway.service)
 SESSION=ww-session.service
 SUN=sunshine-wayland.service
 
@@ -29,7 +27,7 @@ warn() { printf '\033[1;33m[host]\033[0m %s\n' "$*"; }
 status() {
     log "当前状态"
     local u a e
-    for u in "$SESSION" "$SUN" "${RETIRED[@]}" "$DISTRO_UNIT"; do
+    for u in "$SESSION" "$SUN" "$DISTRO_UNIT"; do
         a="$(systemctl --user is-active "$u" 2>/dev/null | head -1 || true)"
         [ -n "$a" ] || a="$(systemctl is-active "$u" 2>/dev/null | head -1 || true)"
         e="$(systemctl --user is-enabled "$u" 2>/dev/null | head -1 || true)"
@@ -60,15 +58,7 @@ esac
 RESTART_SESSION=0
 [ "${1:-}" = "--restart-session" ] && RESTART_SESSION=1
 
-# ── 1. 退休浏览器链路（先停，避免和 Sunshine 抢 screencopy / 8443 端口）──────
-for u in "${RETIRED[@]}"; do
-    if systemctl --user list-unit-files "$u" >/dev/null 2>&1; then
-        systemctl --user disable --now "$u" 2>/dev/null || true
-        log "已停用并取消自启：$u"
-    fi
-done
-
-# ── 2. 关掉发行版自带的 Sunshine 单元（环境错 → 抓帧必失败 → 黑屏）──────────
+# ── 1. 关掉发行版自带的 Sunshine 单元（环境错 → 抓帧必失败 → 黑屏）──────────
 # 本机是 user 单元：user manager 在开机（linger）时直接拉起，环境里只有
 # DISPLAY=:0 / XDG_SESSION_TYPE=x11，没有 WAYLAND_DISPLAY。必须停用并 mask，
 # 否则它和本项目的 sunshine-wayland 抢 47984-47990 端口。
@@ -91,7 +81,7 @@ case "$(distro_scope)" in
     *) warn "没找到发行版单元 $DISTRO_UNIT，跳过" ;;
 esac
 
-# ── 2.5 纯 Wayland：关掉 X11 相关的自启 ────────────────────────────────────
+# ── 2. 纯 Wayland：关掉 X11 相关的自启 ──────────────────────────────────────
 # user manager 里残留的 DISPLAY 会被**所有**用户单元继承（发行版 Sunshine 单元
 # 「在 X11 环境里跑」就是这么来的），直接清掉。
 systemctl --user unset-environment DISPLAY XAUTHORITY 2>/dev/null || true
@@ -160,6 +150,3 @@ fi
 
 sleep 2
 status
-if grep -q 'ww-invisible' "$UNIT_DIR/$SESSION" 2>/dev/null; then
-    warn "$SESSION 里仍带着透明光标主题，串流会看不到指针：用 --restart-session 重启会话。"
-fi

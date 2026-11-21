@@ -97,7 +97,6 @@ for m in json.load(sys.stdin):
         echo "  （没有运行中的 Hyprland）"
     fi
     if pgrep -x sunshine >/dev/null 2>&1; then echo "  Sunshine: running"; else echo "  Sunshine: stopped"; fi
-    if pgrep -x wwcap >/dev/null 2>&1; then echo "  wwcap: running"; else echo "  wwcap: stopped"; fi
 }
 
 case "${1:-show}" in

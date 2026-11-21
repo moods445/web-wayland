@@ -33,9 +33,9 @@ log() { printf '\033[1;34m[switch]\033[0m %s\n' "$*"; }
 
 case "$GPU" in
     intel)
-        CARD=/dev/dri/card1; ENC=vaapi; MAX=3200x1800; CAP=shm; MODE="${MODE:-1920x1080}" ;;
+        CARD=/dev/dri/card1; ENC=vaapi; MODE="${MODE:-1920x1080}" ;;
     nvidia)
-        CARD=/dev/dri/card0; ENC=nvenc; MAX=3840x2160; CAP=sc; MODE="${MODE:-3840x2160}" ;;
+        CARD=/dev/dri/card0; ENC=nvenc; MODE="${MODE:-3840x2160}" ;;
     *)
         echo "用法: $0 {intel|nvidia}" >&2; exit 1 ;;
 esac
@@ -52,12 +52,11 @@ mkdir -p "$HOME/.config/hypr"; echo "$GPU" > "$HOME/.config/hypr/display.state"
 if systemctl --user is-active --quiet ww-session 2>/dev/null \
     || systemctl --user is-active --quiet sunshine-wayland 2>/dev/null; then
     log "检测到 systemd 常驻，先停整条服务链（避免双 Hyprland 嵌套）"
-    systemctl --user stop sunshine-wayland ww-cap ww-gateway ww-session 2>/dev/null || true
+    systemctl --user stop sunshine-wayland ww-session 2>/dev/null || true
     sleep 3
 fi
 
 log "停止现有会话"
-pkill -f 'wwcap --video' 2>/dev/null || true
 pkill -f start-hyprland 2>/dev/null || true
 pkill -f 'Hyprland --config|/usr/bin/Hyprland' 2>/dev/null || true
 sleep 3
@@ -95,22 +94,4 @@ ms=[m for m in json.load(sys.stdin) if m['name']!='$OUT' and m['width']>0]
 print(max([m['x']+m['width'] for m in ms], default=0))" 2>/dev/null || echo 0)"
 hyprctl keyword monitor "$OUT,$MODE@60,${OX:-0}x0,$SCALE" >/dev/null 2>&1 || true
 
-if [ "${WITH_WWCAP:-0}" != "1" ]; then
-    # 浏览器链路已停用（2026-11-21）：默认只起桌面，抓帧交给 Sunshine。
-    # 真的要回到自建链路时加 WITH_WWCAP=1（或直接跑 scripts/install-services.sh）。
-    log "不拉起 wwcap（已停用，需显式 WITH_WWCAP=1；输出留给 Sunshine）"
-else
-    WL="$(ls "$XDG_RUNTIME_DIR" | grep -E '^wayland-[0-9]+$' | head -1)"
-    log "启动抓帧编码（$ENC，抓帧 $CAP，输出 $OUT）"
-    (setsid env XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" WAYLAND_DISPLAY="$WL" \
-        "$ROOT/capture/build/wwcap" \
-        --video "$XDG_RUNTIME_DIR/ww-video.sock" \
-        --ctrl "$XDG_RUNTIME_DIR/wwcap-ctrl.sock" \
-        --audio "$XDG_RUNTIME_DIR/ww-audio.sock" \
-        --capture "$CAP" --enc "$ENC" --output "$OUT" --max "$MAX" \
-        > /tmp/wwcap.log 2>&1 &)
-    sleep 4
-    grep -aE '就绪|输出 ' /tmp/wwcap.log | tail -3 || true
-fi
-
-log "就绪：GPU=$GPU 输出=$OUT 分辨率=$MODE@60 scale=$SCALE 编码=$ENC 抓帧=$CAP"
+log "就绪：GPU=$GPU 输出=$OUT 分辨率=$MODE@60 scale=$SCALE 编码=$ENC（抓帧交给 Sunshine）"
