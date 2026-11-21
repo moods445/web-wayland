@@ -33,20 +33,26 @@ log() { printf '\033[1;34m[switch]\033[0m %s\n' "$*"; }
 
 case "$GPU" in
     intel)
-        CARD=/dev/dri/card1; ENC=vaapi; MAX=3200x1800; CAP=shm; MODE=1920x1080 ;;
+        CARD=/dev/dri/card1; ENC=vaapi; MAX=3200x1800; CAP=shm; MODE="${MODE:-1920x1080}" ;;
     nvidia)
-        CARD=/dev/dri/card0; ENC=nvenc; MAX=3840x2160; CAP=sc; MODE=3840x2160 ;;
+        CARD=/dev/dri/card0; ENC=nvenc; MAX=3840x2160; CAP=sc; MODE="${MODE:-3840x2160}" ;;
     *)
         echo "用法: $0 {intel|nvidia}" >&2; exit 1 ;;
 esac
+# 虚拟输出的缩放（1 = 不缩放，2 = 4K 逻辑 1080p）
+SCALE="${SCALE:-1}"
+# 记录当前会话用的卡，sunshine-wayland.sh 据此选编码器（独显必须 nvenc）
+mkdir -p "$HOME/.config/hypr"; echo "$GPU" > "$HOME/.config/hypr/display.state"
 
 # systemd 常驻时不能只 pkill：`ww-session` 是 Restart=always，会立刻拉起一个新的
 # Hyprland，而这个新实例拿不到 DRM master，会退化成**嵌套**会话（多出一个
 # WAYLAND-1 伪输出）。后果是每个画面被合成两遍（fps 58→30、输入延迟翻倍），
 # 且输入坐标系变成两个输出的并集，鼠标移动只有一半位移——表现为「鼠标非常卡」。
-if systemctl --user is-active --quiet ww-session 2>/dev/null; then
+# Sunshine 依赖这个会话（PartOf=ww-session），必须一起停，否则它会挂在旧 socket 上。
+if systemctl --user is-active --quiet ww-session 2>/dev/null \
+    || systemctl --user is-active --quiet sunshine-wayland 2>/dev/null; then
     log "检测到 systemd 常驻，先停整条服务链（避免双 Hyprland 嵌套）"
-    systemctl --user stop ww-cap ww-gateway ww-session 2>/dev/null || true
+    systemctl --user stop sunshine-wayland ww-cap ww-gateway ww-session 2>/dev/null || true
     sleep 3
 fi
 
@@ -81,18 +87,30 @@ OUT="$(hyprctl -j monitors 2>/dev/null | python3 -c \
 ms=json.load(sys.stdin)
 print(next((m['name'] for m in ms if m['name'].startswith('HEADLESS')), ms[0]['name']))" \
     2>/dev/null || echo HEADLESS-1)"
-hyprctl keyword monitor "$OUT,$MODE@60,0x0,1" >/dev/null 2>&1 || true
+# 若还有别的输出在用，把 headless 放到它右侧（同坐标重叠会让 screencopy 抓到错层）；
+# 只剩虚拟输出时用 0x0，与 nwg-displays 导出的 monitors.conf 保持一致
+OX="$(hyprctl -j monitors 2>/dev/null | python3 -c "
+import json,sys
+ms=[m for m in json.load(sys.stdin) if m['name']!='$OUT' and m['width']>0]
+print(max([m['x']+m['width'] for m in ms], default=0))" 2>/dev/null || echo 0)"
+hyprctl keyword monitor "$OUT,$MODE@60,${OX:-0}x0,$SCALE" >/dev/null 2>&1 || true
 
-WL="$(ls "$XDG_RUNTIME_DIR" | grep -E '^wayland-[0-9]+$' | head -1)"
-log "启动抓帧编码（$ENC，抓帧 $CAP，输出 $OUT）"
-(setsid env XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" WAYLAND_DISPLAY="$WL" \
-    "$ROOT/capture/build/wwcap" \
-    --video "$XDG_RUNTIME_DIR/ww-video.sock" \
-    --ctrl "$XDG_RUNTIME_DIR/wwcap-ctrl.sock" \
-    --audio "$XDG_RUNTIME_DIR/ww-audio.sock" \
-    --capture "$CAP" --enc "$ENC" --output "$OUT" --max "$MAX" \
-    > /tmp/wwcap.log 2>&1 &)
-sleep 4
+if [ "${WITH_WWCAP:-0}" != "1" ]; then
+    # 浏览器链路已停用（2026-11-21）：默认只起桌面，抓帧交给 Sunshine。
+    # 真的要回到自建链路时加 WITH_WWCAP=1（或直接跑 scripts/install-services.sh）。
+    log "不拉起 wwcap（已停用，需显式 WITH_WWCAP=1；输出留给 Sunshine）"
+else
+    WL="$(ls "$XDG_RUNTIME_DIR" | grep -E '^wayland-[0-9]+$' | head -1)"
+    log "启动抓帧编码（$ENC，抓帧 $CAP，输出 $OUT）"
+    (setsid env XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" WAYLAND_DISPLAY="$WL" \
+        "$ROOT/capture/build/wwcap" \
+        --video "$XDG_RUNTIME_DIR/ww-video.sock" \
+        --ctrl "$XDG_RUNTIME_DIR/wwcap-ctrl.sock" \
+        --audio "$XDG_RUNTIME_DIR/ww-audio.sock" \
+        --capture "$CAP" --enc "$ENC" --output "$OUT" --max "$MAX" \
+        > /tmp/wwcap.log 2>&1 &)
+    sleep 4
+    grep -aE '就绪|输出 ' /tmp/wwcap.log | tail -3 || true
+fi
 
-log "就绪：GPU=$GPU 输出=$OUT 编码=$ENC 抓帧=$CAP"
-grep -aE '就绪|输出 ' /tmp/wwcap.log | tail -3 || true
+log "就绪：GPU=$GPU 输出=$OUT 分辨率=$MODE@60 scale=$SCALE 编码=$ENC 抓帧=$CAP"

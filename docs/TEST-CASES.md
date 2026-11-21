@@ -27,6 +27,7 @@
 - [M. 色度采样 4:4:4](#m-色度采样-444)
 - [N. 开机自启与空闲休眠](#n-开机自启与空闲休眠)
 - [O. 原生客户端（wwclient）](#o-原生客户端wwclient)
+- [S. Sunshine-only 部署验收（2026-11-21 起，人工）](#s-sunshine-only-部署验收2026-11-21-起人工)
 
 ---
 
@@ -371,6 +372,27 @@ SDL_VIDEODRIVER=offscreen ./wwclient --size 1920x1080 --no-vsync --dump-gl /tmp/
 | NAT-10 | peer 超时释放 | 客户端运行中 `kill -9` | 等 5 s 看网关日志 | 打印「原生客户端超时断开」，向 wwcap 发 `keysreset/mode reset/fps 0/astream 0` | [native.rs](../gateway/src/native.rs) 的 `release_and_idle` |
 | NAT-11 | 空闲休眠联动 | 只有一个原生客户端 | 断开后等 30 s | wwcap 进入休眠；新客户端连上立即唤醒并出 IDR | [main.c](../capture/src/main.c) 的 `suspended` + `active` 分支 |
 | NAT-12 | 弱网灵敏度矩阵 | `wwsrc --drop 0/0.1/1` | 各跑 10 s | 0%：60 fps/0 损帧；0.1%：仍 >45 fps 且 `undecodable=0`；1%：显著掉帧但不崩、不花屏 | [wwsrc.c](../native/wwsrc.c) 的 `--drop` |
+
+---
+
+## S. Sunshine-only 部署验收（2026-11-21 起，人工）
+
+当前部署形态是 **Hyprland + Sunshine（Moonlight 客户端）**，浏览器链路已停用。下面这组用例
+是这一形态的验收清单，全部为人工执行（`MAN-S*`）。
+
+| 编号 | 用例 | 步骤 | 预期 |
+|---|---|---|---|
+| MAN-S1 | 冷启动链路 | `systemctl --user stop sunshine-wayland ww-session` → `systemctl --user start ww-session sunshine-wayland` | 30s 内两个单元 active；只有 1 个 Hyprland（无嵌套、非 safe-mode）；`HEADLESS-*` 按 `monitors.conf` 创建；47984/47989/47990 监听 |
+| MAN-S2 | 抓帧后端就绪 | `scripts/sunshine-wayland.sh doctor` | 输出行有 `[wayland] Name: <输出>`、`Screencasting with Wayland's protocol`，失败帧 0，Hyprland EGL 错误 0，结论「环境正常」|
+| MAN-S3 | 客户端串流 | Moonlight 连 `192.168.0.109` → `Desktop` | 约 1s 出画面；光标可见且跟随；键鼠可用（`hyprctl devices` 出现 `libvirtualhid-*`） |
+| MAN-S4 | 纯 Wayland | `pgrep -a 'Xorg\|Xwayland'`；`systemctl --user show-environment \| grep -i display` | 两条都为空（`xwayland.enabled=false`、`DISPLAY` 已 unset） |
+| MAN-S5 | X11 自启已关 | `systemctl is-enabled sddm x11-common`；`systemctl --user list-unit-files \| grep lxqt` | 前者 masked；后者 `app-lxqt-*@autostart` 全部 masked |
+| MAN-S6 | 分辨率切换 | `scripts/sunshine-wayland.sh mode 2560x1440 1`（再切回 `1920x1080 1`） | 新 `HEADLESS-N` 直接是 2560x1440；旧输出被删；Sunshine 自动重启；`monitors.conf` 名字同步 |
+| MAN-S7 | 独显守卫 | `scripts/switch-display.sh nvidia 3840x2160 2` → `scripts/sunshine-wayland.sh status` | Sunshine **拒绝启动**（未修复 bug，见 `bugs/sunshine-nvidia-black-screen.md`），`doctor` 给出原因；切回 `intel 1920x1080 1` 恢复 |
+| MAN-S8 | 浏览器链路已停 | `systemctl --user is-enabled ww-cap ww-gateway`；`pgrep -a 'wwcap\|wwgw'` | disabled；无进程 |
+| MAN-S9 | 字号档位生效 | `scripts/font-scale.sh status` | GTK=1.3；waybar 16px/高 46；fuzzel 14pt；foot 18px；光标 31px；输出 scale=1.0 |
+| MAN-S10 | 画面未缩放（不糊） | `grim -o HEADLESS-2 /tmp/s.png`，1:1 查看；`scripts/font-scale.sh status` 第 7 行 | PNG 恰为 1920×1080；文字笔画 1px 级过渡（无 2×2 重复像素块）；无 `GDK_SCALE`/`QT_SCALE_FACTOR` |
+| MAN-S11 | 档位可回滚 | `scripts/font-scale.sh 1.0` → 再 `1.3` | 回滚后字号回到原始值（waybar 12px/38）；再切回 1.3 与 MAN-S9 一致 |
 
 ---
 

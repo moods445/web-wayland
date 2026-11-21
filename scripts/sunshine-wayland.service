@@ -1,0 +1,23 @@
+[Unit]
+Description=Sunshine / Moonlight 服务端（Wayland 抓帧，自动跟随会话）
+Documentation=file:///home/aio/gitWorkspace/web-wayland/docs/sunshine-moonlight.md
+# 抓帧必须有 Hyprland 会话；会话重建时本服务一起重建（PartOf + Wants）
+After=ww-session.service
+Wants=ww-session.service
+PartOf=ww-session.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# 清掉调用方/环境带进来的私有库路径（旧 libstdc++ 会让二进制起不来）
+Environment=LD_LIBRARY_PATH=
+# 脚本负责：等 Wayland socket → 探测抓帧卡/编码器/输出名 → 写 sunshine.conf
+#          → 前台 exec sunshine（env -u DISPLAY，避免走 X11 分支）
+ExecStart=%h/gitWorkspace/web-wayland/scripts/sunshine-wayland.sh run
+Restart=on-failure
+RestartSec=5
+# 退出码 3 = 脚本主动拒绝（独显会话上 wlr 抓帧不可用），别无限重试刷日志
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=default.target

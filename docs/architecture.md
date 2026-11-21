@@ -1,5 +1,9 @@
 # 架构与实测基线
 
+> **状态（2026-11-21）**：本机已停用自建浏览器链路（`wwcap` / `wwgw` / `web`），改为 **Sunshine + Moonlight**
+> 串流主机（部署见 [sunshine-moonlight.md](sunshine-moonlight.md)）。下文的数据流是**自建链路的历史架构**
+> 与踩坑基线，留作回滚参考，不代表当前运行形态。
+
 ## 数据流
 
 ```

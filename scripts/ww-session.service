@@ -1,8 +1,5 @@
 [Unit]
-Description=web-wayland Hyprland 桌面会话（iGPU）
-# seatd 提供 DRM 访问权：SSH/无 seat 会话下 libseat 的唯一出路
-After=seatd.service
-Wants=seatd.service
+Description=Hyprland 桌面会话（Moonlight/Sunshine 抓帧目标）
 
 [Service]
 Type=simple
@@ -10,12 +7,23 @@ Environment=LIBSEAT_BACKEND=seatd
 Environment=AQ_DRM_DEVICES=/dev/dri/card1
 Environment=HYPRLAND_NO_SD_NOTIFY=1
 Environment=HYPRLAND_NO_CRASHREPORTER=1
-# 光标由客户端本地绘制（延迟 0ms），服务端用全透明主题让合成器不画光标；
-# 主题必须在启动前通过环境变量给定——运行时 `hyprctl setcursor` 对 Xcursor 主题无效。
-Environment=XCURSOR_THEME=ww-invisible
-Environment=XCURSOR_SIZE=24
+# 不要设 XCURSOR_THEME=ww-invisible：那是浏览器链路「客户端自绘光标」的配套，
+# 用在 Moonlight 上会让串流画面里完全没有指针（Sunshine 把光标编进视频帧）。
+# 指针尺寸只能在启动时用环境变量给（Hyprland 没有 cursor:size 选项）；
+# 值随字号档位变化，由 scripts/font-scale.sh 同步维护（默认档 1.3 → 31）。
+Environment=XCURSOR_SIZE=31
+Environment=HYPRCURSOR_SIZE=31
 # 清掉调用方可能带进来的私有库路径（旧 libstdc++ 会让 start-hyprland 报 GLIBCXX 缺失）
 Environment=LD_LIBRARY_PATH=
+# seatd 是**系统级**单元（提供 DRM 访问权，SSH/无 seat 会话下 libseat 的唯一出路），
+# 用户单元没法用 Wants= 跨作用域依赖它（那个依赖会被静默忽略），
+# 所以这里在启动前主动等它 active（最多 60s，等不到也继续，靠 Restart= 兜底重试）。
+ExecStartPre=/bin/sh -c 'i=0; while [ $i -lt 60 ]; do systemctl is-active --quiet seatd.service && exit 0; i=$((i+1)); sleep 1; done; exit 0'
+# 清掉**不属于本单元**的残留 Hyprland：手工起的实例会占住 DRM master 和
+# wayland-1.lock，导致本单元拉起的实例退化成嵌套会话（多一个 WAYLAND-N 伪输出、
+# 画面合成两遍、鼠标位移减半）。用 -x（精确进程名），不要用 -f（会匹配到自身命令行）。
+ExecStartPre=-/usr/bin/pkill -x Hyprland
+ExecStartPre=-/usr/bin/pkill -x start-hyprland
 # 一定要显式指定配置：Hyprland 0.5x 默认优先加载 hyprland.lua，
 # 不指定就会用 /usr/share/hypr/hyprland.lua 的示例配置，项目里的绑定/显示器规则全部失效
 ExecStart=/usr/bin/start-hyprland -- --config %h/.config/hypr/hyprland.conf

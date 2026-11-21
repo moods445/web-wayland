@@ -15,6 +15,22 @@ wwgw    Rust · wtransport(QUIC) + HTTPS 静态托管 + IP 白名单 + 关键帧
 web     JS · WebCodecs 解码 + canvas 上屏 + 键鼠捕获（无构建步骤）
 ```
 
+> **当前本机部署（2026-11-21 起）：只跑 Moonlight + Sunshine。**
+> 固定 **1920×1080@60 + scale=1**（逻辑 1080p），觉得字小用字号档位
+> `scripts/font-scale.sh 1.3`（**不要**用 scale 放大，会发虚）：见
+> [docs/sunshine-moonlight.md §12](docs/sunshine-moonlight.md#12-1080p1x-的字号放大不糊)。
+> 浏览器链路（`wwcap` / `wwgw` / `web`）已停止并取消开机自启，代码保留；
+> 开机自启只剩 `ww-session`（Hyprland 桌面）+ `sunshine-wayland`（Sunshine 用户单元）。
+> 部署、运维与排障见 [docs/sunshine-moonlight.md](docs/sunshine-moonlight.md)：
+>
+> ```bash
+> scripts/install-sunshine-host.sh --restart-session   # 一键切到 Sunshine-only
+> scripts/sunshine-wayland.sh doctor                   # 黑屏时先跑这个
+> ```
+>
+> 下文「浏览器链路」的安装/构建/自启步骤保留作历史与回滚参考
+> （回滚：`systemctl --user disable --now sunshine-wayland && scripts/install-services.sh`）。
+
 ## 快速开始
 
 ```bash

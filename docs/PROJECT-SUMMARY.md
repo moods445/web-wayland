@@ -1,7 +1,19 @@
 # web-wayland 项目完整汇总
 
 > 本文是整个项目从需求提出到当前的完整汇总：诉求演进、系统架构、全部文件改动、全部 bug 修复、性能实测、测试工具、当前状态与待决策事项。
-> 聚焦某主题时可转阅：`README.md`（上手/部署）、`docs/architecture.md`（架构/踩坑基线）、`docs/streaming-conclusions.md`（最新一轮结论与 4K60 分析）、`docs/sunshine-moonlight.md`（旁挂 Sunshine + Moonlight 部署）。
+> 聚焦某主题时可转阅：`README.md`（上手/部署）、`docs/architecture.md`（架构/踩坑基线）、`docs/streaming-conclusions.md`（最新一轮结论与 4K60 分析）、`docs/sunshine-moonlight.md`（**当前部署**：Sunshine + Moonlight）。
+
+> **2026-11-21 部署变更（当前形态）**
+> 本机改为 **Sunshine-only 串流主机**：Moonlight 作为客户端，Sunshine 作为服务端；自建的浏览器链路
+> （`wwcap` + `wwgw` + `web`）已停止并取消开机自启（代码保留，可回滚）。
+> 同时**彻底关闭 X11**：`sddm` / `x11-common` 已 mask、Hyprland 的 `xwayland.enabled = false`、
+> LXQt（X11）自启单元已 mask、user manager 里残留的 `DISPLAY` 已清除。
+> 开机自启只剩 `ww-session`（Hyprland 桌面）+ `sunshine-wayland`（Sunshine 用户单元），`linger=yes`
+> 无需登录；冷启动已用「停全部单元 → 一次性 start」验证三轮（单实例、无嵌套、非 safe-mode、
+> 抓帧失败 0、X11 进程 0）。
+> 当前形态、开机行为、分辨率切换、已修复的坑、排障手册全部在
+> [docs/sunshine-moonlight.md](sunshine-moonlight.md)；唯一遗留 bug（独显虚拟输出抓帧）在
+> [bugs/sunshine-nvidia-black-screen.md](../bugs/sunshine-nvidia-black-screen.md)。
 
 ---
 
@@ -33,6 +45,10 @@
 | 14 | 三档串流策略（平衡/流畅优先/画质优先）+ 4:4:4 色度采样；策略只调 QP 与帧率，分辨率固定 |
 | 15 | 修 4:4:4 切换后客户端仍按 4:2:0 解码：解析 SPS profile 变化后等 IDR 重建解码器 |
 | 16 | 服务开机自启（systemd 用户单元 + linger）、无会话 30 秒自动休眠；补测试文档并提交 git |
+| 17 | 关闭除 Moonlight + Sunshine 以外的所有功能及其开机自启（浏览器链路停用）|
+| 18 | 修复 Moonlight 全黑：发行版单元在 X11 环境下启动 + 编码器跨 GPU + 透明光标；新增 `doctor` 自检 |
+| 19 | 完全关闭 X11（sddm / Xwayland / LXQt 自启 / 残留 `DISPLAY`）；验证重启后可直接用 Moonlight 连接 |
+| 20 | 固定 1080p60 + scale=1，用「只放大字号」解决字小（`scripts/font-scale.sh` 四档），避免任何画面缩放导致的发虚 |
 
 ---
 
